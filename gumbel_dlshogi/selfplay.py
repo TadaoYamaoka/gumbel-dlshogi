@@ -3,7 +3,6 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from queue import Queue
-from typing import Literal
 
 import numpy as np
 import torch
@@ -15,7 +14,6 @@ from cshogi import (
     REPETITION_DRAW,
     REPETITION_LOSE,
     REPETITION_WIN,
-    WHITE,
     WHITE_WIN,
     Board,
     HuffmanCodedPos,
