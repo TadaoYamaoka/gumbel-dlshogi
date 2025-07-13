@@ -11,6 +11,8 @@ from gumbel_dlshogi.mcts.action_selection import (
 )
 from gumbel_dlshogi.mcts.tree import Tree
 
+MAX_MOVES = 512
+
 
 def search(
     board: Board,
@@ -124,6 +126,7 @@ def simulate(
             board.is_game_over()
             or board.is_nyugyoku()
             or board.is_draw() in (REPETITION_DRAW, REPETITION_WIN, REPETITION_LOSE)
+            or board.move_number >= MAX_MOVES
         ):
             is_continuing = False
 

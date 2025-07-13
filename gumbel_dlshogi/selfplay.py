@@ -11,6 +11,7 @@ from gumbel_dlshogi.features import (
 from gumbel_dlshogi.mcts.action_selection import init_table
 from gumbel_dlshogi.mcts.base import EvaluationStep, RootFnOutput
 from gumbel_dlshogi.mcts.policies import _mask_invalid_actions, gumbel_muzero_policy
+from gumbel_dlshogi.mcts.search import MAX_MOVES
 
 
 class Actor:
@@ -68,6 +69,7 @@ class Actor:
                 or self.board.is_nyugyoku()
                 or self.board.is_draw()
                 in (REPETITION_DRAW, REPETITION_WIN, REPETITION_LOSE)
+                or self.board.move_number >= MAX_MOVES
             ):
                 self.board.reset()
 
