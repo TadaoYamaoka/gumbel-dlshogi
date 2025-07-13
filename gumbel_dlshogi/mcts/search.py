@@ -1,7 +1,7 @@
 from typing import Any, NamedTuple, Optional, Tuple
 
 import numpy as np
-from cshogi import Board
+from cshogi import REPETITION_DRAW, REPETITION_LOSE, REPETITION_WIN, Board
 
 from gumbel_dlshogi.features import make_move_label
 from gumbel_dlshogi.mcts import base
@@ -108,6 +108,7 @@ def simulate(
         # The returned action will be visited.
         depth = state.depth + 1
         is_visited = next_node_index != Tree.UNVISITED
+        is_continuing = is_visited
 
         move = next(
             (
@@ -119,13 +120,19 @@ def simulate(
         )
         assert move is not None
         board.push(move)
+        if (
+            board.is_game_over()
+            or board.is_nyugyoku()
+            or board.is_draw() in (REPETITION_DRAW, REPETITION_WIN, REPETITION_LOSE)
+        ):
+            is_continuing = False
 
         return _SimulationState(
             node_index=node_index,
             action=action,
             next_node_index=next_node_index,
             depth=depth,
-            is_continuing=is_visited,
+            is_continuing=is_continuing,
         )
 
     node_index = np.array(Tree.ROOT_INDEX, dtype=np.int32)

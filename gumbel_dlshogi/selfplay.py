@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from cshogi import Board
+from cshogi import REPETITION_DRAW, REPETITION_LOSE, REPETITION_WIN, Board
 
 from gumbel_dlshogi.features import (
     FEATURES_NUM,
@@ -60,10 +60,15 @@ class Actor:
             )
             assert move is not None
             self.board.push(move)
-            self.step = None
+            self.step = EvaluationStep()
             self.generator = None
 
-            if self.board.is_game_over():
+            if (
+                self.board.is_game_over()
+                or self.board.is_nyugyoku()
+                or self.board.is_draw()
+                in (REPETITION_DRAW, REPETITION_WIN, REPETITION_LOSE)
+            ):
                 self.board.reset()
 
 

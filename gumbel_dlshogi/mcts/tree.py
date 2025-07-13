@@ -71,7 +71,7 @@ class Tree:
         value = self.node_values[Tree.ROOT_INDEX]
         qvalue = self.qvalues(Tree.ROOT_INDEX)
         # Extract visit counts and induced probabilities for the root nodes.
-        visit_counts = self.children_visits[:, Tree.ROOT_INDEX].astype(value.dtype)
+        visit_counts = self.children_visits[Tree.ROOT_INDEX].astype(value.dtype)
         total_counts = np.sum(visit_counts, axis=-1, keepdims=True)
         visit_probs = visit_counts / np.maximum(total_counts, 1)
         visit_probs = np.where(total_counts > 0, visit_probs, 1 / self.num_actions)

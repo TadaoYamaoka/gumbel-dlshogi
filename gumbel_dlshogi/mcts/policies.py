@@ -90,9 +90,7 @@ def gumbel_muzero_policy(
         root.prior_logits + completed_qvalues, invalid_actions
     )
     action_weights = softmax(completed_search_logits)
-    return base.PolicyOutput(
-        action=action, action_weights=action_weights, search_tree=tree
-    )
+    return base.PolicyOutput(action=action, action_weights=action_weights)
 
 
 def _mask_invalid_actions(logits, invalid_actions):
