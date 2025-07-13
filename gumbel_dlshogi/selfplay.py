@@ -161,7 +161,7 @@ def write_training_data(queue: Queue, output_dir: str):
                 result = BLACK_WIN
             else:
                 result = WHITE_WIN
-        elif training_data.is_draw == REPETITION_DRAW:
+        else:
             result = DRAW
 
         data = np.empty(len(training_data.policy_outputs), dtype=dtypeTrainingData)
