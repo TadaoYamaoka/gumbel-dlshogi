@@ -197,6 +197,7 @@ def backward(board: Board, tree: Tree, leaf_index: np.int32):
     def body_fun(loop_state):
         # Here we update the value of our parent, so we start by reversing.
         leaf_value, index = loop_state
+        leaf_value = 1 - leaf_value
         parent = tree.parents[index]
         count = tree.node_visits[parent]
         action = tree.action_from_parent[index]
@@ -206,7 +207,7 @@ def backward(board: Board, tree: Tree, leaf_index: np.int32):
 
         tree.node_values[parent] = parent_value
         tree.node_visits[parent] = count + 1
-        tree.children_values[parent, action] = children_value
+        tree.children_values[parent, action] = 1 - children_value
         tree.children_visits[parent, action] = children_count
 
         board.pop()
