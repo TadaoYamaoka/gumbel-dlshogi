@@ -201,13 +201,13 @@ def backward(board: Board, tree: Tree, leaf_index: np.int32):
         count = tree.node_visits[parent]
         action = tree.action_from_parent[index]
         parent_value = (tree.node_values[parent] * count + leaf_value) / (count + 1.0)
-        children_values = tree.node_values[index]
-        children_counts = tree.children_visits[parent, action] + 1
+        children_value = tree.node_values[index]
+        children_count = tree.children_visits[parent, action] + 1
 
         tree.node_values[parent] = parent_value
         tree.node_visits[parent] = count + 1
-        tree.children_values[parent, action] = children_values
-        tree.children_visits[parent, action] = children_counts
+        tree.children_values[parent, action] = children_value
+        tree.children_visits[parent, action] = children_count
 
         board.pop()
 
