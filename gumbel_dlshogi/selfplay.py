@@ -17,9 +17,11 @@ from cshogi import (
     WHITE_WIN,
     Board,
     HuffmanCodedPos,
-    dtypeHcp,
 )
+from torch.cuda.amp import autocast
+from tqdm import tqdm
 
+from gumbel_dlshogi.common import dtypeTrainingData
 from gumbel_dlshogi.features import (
     FEATURES_NUM,
     MOVE_LABELS_NUM,
@@ -42,15 +44,6 @@ class TrainingData:
     is_nyugyoku: bool
     is_draw: int
     is_max_moves: bool
-
-
-dtypeTrainingData = np.dtype(
-    [
-        ("hcp", dtypeHcp),
-        ("result", np.uint8),
-        ("policy", np.dtype((np.float32, MOVE_LABELS_NUM))),
-    ]
-)
 
 
 class Actor:
@@ -137,45 +130,54 @@ class Actor:
                 self.policy_outputs = []
 
 
-def write_training_data(queue: Queue, output_dir: str):
+def write_training_data(queue: Queue, output_dir: str, num_positions: int):
     os.makedirs(output_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     filename = f"{timestamp}.data"
     filepath = os.path.join(output_dir, filename)
 
-    while True:
-        training_data = queue.get()
-        if training_data is None:
-            break
+    with tqdm(total=num_positions, unit="pos") as pbar:
+        while pbar.n < num_positions:
+            training_data = queue.get()
+            if training_data is None:
+                break
 
-        if training_data.is_game_over or training_data.is_draw == REPETITION_LOSE:
-            if training_data.turn == BLACK:
-                result = WHITE_WIN
+            if training_data.is_game_over or training_data.is_draw == REPETITION_LOSE:
+                if training_data.turn == BLACK:
+                    result = WHITE_WIN
+                else:
+                    result = BLACK_WIN
+            elif training_data.is_nyugyoku or training_data.is_draw == REPETITION_WIN:
+                if training_data.turn == BLACK:
+                    result = BLACK_WIN
+                else:
+                    result = WHITE_WIN
             else:
-                result = BLACK_WIN
-        elif training_data.is_nyugyoku or training_data.is_draw == REPETITION_WIN:
-            if training_data.turn == BLACK:
-                result = BLACK_WIN
-            else:
-                result = WHITE_WIN
-        else:
-            result = DRAW
+                result = DRAW
 
-        data = np.empty(len(training_data.policy_outputs), dtype=dtypeTrainingData)
-        for i, (hcp, policy_output) in enumerate(
-            zip(training_data.hcps, training_data.policy_outputs)
-        ):
-            data[i]["hcp"] = hcp
-            data[i]["result"] = result
-            data[i]["policy"] = policy_output.action_weights
+            data = np.empty(len(training_data.policy_outputs), dtype=dtypeTrainingData)
+            for i, (hcp, policy_output) in enumerate(
+                zip(training_data.hcps, training_data.policy_outputs)
+            ):
+                data[i]["hcp"] = hcp
+                data[i]["policy"] = policy_output.action_weights
+                data[i]["result"] = result
 
-        with open(filepath, "ab") as f:
-            data.tofile(f)
+            with open(filepath, "ab") as f:
+                data.tofile(f)
+
+            pbar.update(len(training_data.policy_outputs))
 
 
 def selfplay(
-    model_path, batch_size, max_num_considered_actions, num_simulations, output_dir
+    model_path,
+    batch_size,
+    max_num_considered_actions,
+    num_simulations,
+    output_dir,
+    num_positions,
+    amp,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = torch.jit.load(model_path)
@@ -186,7 +188,7 @@ def selfplay(
 
     queue = Queue()
     writer_thread = threading.Thread(
-        target=write_training_data, args=(queue, output_dir), daemon=True
+        target=write_training_data, args=(queue, output_dir, num_positions), daemon=True
     )
     writer_thread.start()
 
@@ -204,14 +206,15 @@ def selfplay(
     input_features = torch_features.numpy()
 
     try:
-        while True:
+        while writer_thread.is_alive():
             for i, actor in enumerate(actors):
                 actor.next()
                 make_input_features(actor.board, input_features[i])
 
             # Evaluate
-            with torch.no_grad():
-                logits, value = model(torch_features.to(device))
+            with autocast(enabled=amp):
+                with torch.no_grad():
+                    logits, value = model(torch_features.to(device))
 
             for i, actor in enumerate(actors):
                 actor.step.prior_logits = logits[i].cpu().numpy()
@@ -241,6 +244,11 @@ if __name__ == "__main__":
     parser.add_argument("--max_num_considered_actions", type=int, default=16)
     parser.add_argument("--num_simulations", type=int, default=32)
     parser.add_argument("--output_dir", default="training_data")
+    parser.add_argument("--num_positions", type=int, default=1000000)
+    parser.add_argument(
+        "--amp", action="store_true", help="Use automatic mixed precision"
+    )
+
     args = parser.parse_args()
 
     selfplay(
@@ -249,4 +257,6 @@ if __name__ == "__main__":
         args.max_num_considered_actions,
         args.num_simulations,
         args.output_dir,
+        args.num_positions,
+        args.amp,
     )
