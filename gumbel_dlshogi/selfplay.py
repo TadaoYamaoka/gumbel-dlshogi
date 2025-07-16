@@ -18,16 +18,16 @@ from cshogi import (
     Board,
     HuffmanCodedPos,
 )
-from torch.cuda.amp import autocast
-from tqdm import tqdm
-
-from gumbel_dlshogi.common import dtypeTrainingData
-from gumbel_dlshogi.features import (
+from pydlshogi2.features import (
     FEATURES_NUM,
     MOVE_LABELS_NUM,
     make_input_features,
     make_move_label,
 )
+from torch.cuda.amp import autocast
+from tqdm import tqdm
+
+from gumbel_dlshogi.common import dtypeTrainingData
 from gumbel_dlshogi.mcts import base
 from gumbel_dlshogi.mcts.action_selection import init_table
 from gumbel_dlshogi.mcts.base import EvaluationStep, RootFnOutput

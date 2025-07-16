@@ -2,8 +2,8 @@ from typing import Any, NamedTuple, Optional, Tuple
 
 import numpy as np
 from cshogi import REPETITION_DRAW, REPETITION_LOSE, REPETITION_WIN, Board
+from pydlshogi2.features import make_move_label
 
-from gumbel_dlshogi.features import make_move_label
 from gumbel_dlshogi.mcts import base
 from gumbel_dlshogi.mcts.action_selection import (
     gumbel_muzero_interior_action_selection,
