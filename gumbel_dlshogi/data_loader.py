@@ -186,7 +186,7 @@ def create_dataloader(
 
     if num_workers > 0:
         # Create a dummy dataset for the main process
-        dataset = TrainingDataset(data_dir, num_files, 0, num_workers)
+        dataset = TrainingDataset(data_dir, num_files)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -357,7 +357,7 @@ def create_test_dataloader(
     """
     if num_workers > 0:
         # Create a dummy dataset for the main process
-        dataset = TestDataset(data_file, 0, num_workers)
+        dataset = TestDataset(data_file)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
