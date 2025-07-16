@@ -46,6 +46,17 @@ class TrainingData:
     is_max_moves: bool
 
 
+def _get_invalid_actions(board: Board) -> np.ndarray:
+    """指定された局面の非合法手のマスクを生成する"""
+    invalid_actions = np.ones(MOVE_LABELS_NUM, dtype=np.int32)
+    legal_move_labels = [
+        make_move_label(move, board.turn) for move in board.legal_moves
+    ]
+    if legal_move_labels:
+        invalid_actions[legal_move_labels] = 0
+    return invalid_actions
+
+
 class Actor:
     def __init__(self, max_num_considered_actions, num_simulations, queue: Queue):
         self.board = Board()
@@ -67,13 +78,7 @@ class Actor:
             self.root = RootFnOutput(
                 prior_logits=self.step.prior_logits, value=self.step.value
             )
-            invalid_actions = np.ones(MOVE_LABELS_NUM, dtype=np.int32)
-            invalid_actions[
-                [
-                    make_move_label(move, self.board.turn)
-                    for move in self.board.legal_moves
-                ]
-            ] = 0
+            invalid_actions = _get_invalid_actions(self.board)
             self.generator = gumbel_muzero_policy(
                 self.board,
                 self.root,
@@ -220,19 +225,121 @@ def selfplay(
                 actor.step.prior_logits = logits[i].cpu().numpy()
                 actor.step.value = value[i].cpu().numpy()[0]
 
-                invalid_actions = np.ones(MOVE_LABELS_NUM, dtype=np.int32)
-                invalid_actions[
-                    [
-                        make_move_label(move, actor.board.turn)
-                        for move in actor.board.legal_moves
-                    ]
-                ] = 0
+                invalid_actions = _get_invalid_actions(actor.board)
                 actor.step.prior_logits = _mask_invalid_actions(
                     actor.step.prior_logits, invalid_actions
                 )
     except KeyboardInterrupt:
         queue.put(None)
         writer_thread.join()
+
+
+def selfplay_worker_mp(
+    lock,
+    model_path,
+    batch_size,
+    max_num_considered_actions,
+    num_simulations,
+    queue,
+    amp,
+):
+    """マルチプロセス用の自己対局ワーカー"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = torch.jit.load(model_path)
+    model.to(device)
+    model.eval()
+
+    init_table(max_num_considered_actions, num_simulations)
+
+    actors = [
+        Actor(max_num_considered_actions, num_simulations, queue)
+        for _ in range(batch_size)
+    ]
+
+    torch_features = torch.empty(
+        (batch_size, FEATURES_NUM, 9, 9),
+        dtype=torch.float32,
+        pin_memory=True,
+        requires_grad=False,
+    )
+    input_features = torch_features.numpy()
+
+    while True:
+        for i, actor in enumerate(actors):
+            actor.next()
+            make_input_features(actor.board, input_features[i])
+
+        # Evaluate with lock
+        with lock:
+            with autocast(enabled=amp):
+                with torch.no_grad():
+                    logits, value = model(torch_features.to(device))
+
+        for i, actor in enumerate(actors):
+            actor.step.prior_logits = logits[i].cpu().numpy()
+            actor.step.value = value[i].cpu().numpy()[0]
+
+            invalid_actions = _get_invalid_actions(actor.board)
+            actor.step.prior_logits = _mask_invalid_actions(
+                actor.step.prior_logits, invalid_actions
+            )
+
+
+def selfplay_multiprocess(
+    model_path,
+    batch_size,
+    max_num_considered_actions,
+    num_simulations,
+    output_dir,
+    num_positions,
+    amp,
+    num_processes,
+):
+    """マルチプロセスで自己対局を実行する"""
+    import multiprocessing as mp
+
+    mp.set_start_method("spawn")
+
+    queue = mp.Manager().Queue()
+    lock = mp.Lock()
+
+    writer_process = mp.Process(
+        target=write_training_data, args=(queue, output_dir, num_positions)
+    )
+    writer_process.start()
+
+    processes = []
+    for _ in range(num_processes):
+        p = mp.Process(
+            target=selfplay_worker_mp,
+            args=(
+                lock,
+                model_path,
+                batch_size,
+                max_num_considered_actions,
+                num_simulations,
+                queue,
+                amp,
+            ),
+            daemon=True,
+        )
+        p.start()
+        processes.append(p)
+
+    try:
+        writer_process.join()
+        # Writerが終了したら、全局面生成完了
+    except KeyboardInterrupt:
+        print("\nTerminating self-play processes.")
+    finally:
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+            p.join()
+        if writer_process.is_alive():
+            writer_process.terminate()
+        writer_process.join()
+        print("All processes terminated.")
 
 
 if __name__ == "__main__":
@@ -248,15 +355,33 @@ if __name__ == "__main__":
     parser.add_argument(
         "--amp", action="store_true", help="Use automatic mixed precision"
     )
+    parser.add_argument(
+        "--num_processes",
+        type=int,
+        default=0,
+        help="Number of self-play processes. If 0, run in single process mode.",
+    )
 
     args = parser.parse_args()
 
-    selfplay(
-        args.model_path,
-        args.batch_size,
-        args.max_num_considered_actions,
-        args.num_simulations,
-        args.output_dir,
-        args.num_positions,
-        args.amp,
-    )
+    if args.num_processes > 0:
+        selfplay_multiprocess(
+            args.model_path,
+            args.batch_size,
+            args.max_num_considered_actions,
+            args.num_simulations,
+            args.output_dir,
+            args.num_positions,
+            args.amp,
+            args.num_processes,
+        )
+    else:
+        selfplay(
+            args.model_path,
+            args.batch_size,
+            args.max_num_considered_actions,
+            args.num_simulations,
+            args.output_dir,
+            args.num_positions,
+            args.amp,
+        )
