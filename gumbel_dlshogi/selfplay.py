@@ -113,7 +113,7 @@ class Actor:
             is_draw = NOT_REPETITION
             is_max_moves = False
             if (
-                is_game_over := self.board.is_game_over()
+                (is_game_over := self.board.is_game_over())
                 or (is_nyugyoku := self.board.is_nyugyoku())
                 or (is_draw := self.board.is_draw())
                 in (REPETITION_DRAW, REPETITION_WIN, REPETITION_LOSE)
