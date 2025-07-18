@@ -162,6 +162,22 @@ def load_checkpoint(filepath, model, optimizer, scaler, device):
     return epoch, loss
 
 
+def load_initial_model(filepath, model, device):
+    """Load initial model state dict"""
+    state_dict = torch.load(filepath, map_location=device)
+    model.load_state_dict(state_dict)
+    print(f"Initial model loaded from {filepath}")
+
+
+def save_torchscript_model(model, filepath):
+    """Save model as TorchScript"""
+    model.eval()
+
+    scripted_model = torch.jit.script(model)
+    scripted_model.save(filepath)
+    print(f"TorchScript model saved to {filepath}")
+
+
 def train(args):
     """Main training function"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -171,6 +187,10 @@ def train(args):
     model = PolicyValueNetwork(
         blocks=args.blocks, channels=args.channels, fcl=args.fcl
     ).to(device)
+
+    # Load initial model if specified
+    if args.initial_model:
+        load_initial_model(args.initial_model, model, device)
 
     # Create optimizer
     optimizer = optim.Adam(
@@ -193,7 +213,7 @@ def train(args):
     if args.test_file:
         test_dataloader = create_test_dataloader(
             args.test_file,
-            batch_size=args.batch_size,
+            batch_size=args.eval_batch_size,
             num_workers=args.num_workers,
             shuffle=False,
         )
@@ -204,13 +224,15 @@ def train(args):
         start_epoch, _ = load_checkpoint(args.resume, model, optimizer, scaler, device)
         start_epoch += 1
 
+    max_epochs = start_epoch + args.epochs
+
     # Create checkpoint directory
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # Training loop
-    for epoch in range(start_epoch, args.epochs):
-        print(f"Epoch {epoch + 1}/{args.epochs}")
+    for epoch in range(start_epoch, max_epochs):
+        print(f"Epoch {epoch + 1}/{max_epochs}")
 
         # Training
         start_time = time.time()
@@ -242,8 +264,8 @@ def train(args):
             )
 
         # Save checkpoint
-        if (epoch + 1) % args.save_interval == 0:
-            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pth"
+        if (epoch + 1) % args.save_interval == 0 or epoch == max_epochs - 1:
+            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1:03d}.pth"
             save_checkpoint(
                 model,
                 optimizer,
@@ -253,10 +275,9 @@ def train(args):
                 checkpoint_path,
             )
 
-    # Save final model
-    final_model_path = checkpoint_dir / "final_model.pth"
-    torch.save(model.state_dict(), final_model_path)
-    print(f"Final model saved to {final_model_path}")
+    # Save TorchScript model if requested
+    if args.save_torchscript:
+        save_torchscript_model(model, args.save_torchscript)
 
 
 def main():
@@ -281,12 +302,17 @@ def main():
     parser.add_argument(
         "--fcl", type=int, default=256, help="Fully connected layer size"
     )
-
+    parser.add_argument(
+        "--initial_model", type=str, help="Path to initial model state dict (.pth file)"
+    )
     # Training arguments
     parser.add_argument(
-        "--epochs", "-e", type=int, default=100, help="Number of training epochs"
+        "--epochs", "-e", type=int, default=1, help="Number of training epochs"
     )
     parser.add_argument("--batch_size", "-b", type=int, default=64, help="Batch size")
+    parser.add_argument(
+        "--eval_batch_size", type=int, default=1024, help="Evaluation batch size"
+    )
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument(
@@ -311,6 +337,12 @@ def main():
     )
     parser.add_argument(
         "--eval_interval", type=int, default=1, help="Evaluate every N epochs"
+    )
+
+    # TorchScript output
+    parser.add_argument(
+        "--save_torchscript",
+        help="Save final model as TorchScript (.pt file)",
     )
 
     args = parser.parse_args()

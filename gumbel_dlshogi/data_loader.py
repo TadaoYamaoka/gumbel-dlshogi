@@ -208,6 +208,12 @@ def create_dataloader(
             **kwargs,
         )
 
+    # Log dataset information
+    if num_files is not None:
+        print(f"Using {len(dataset.files)} files for training:")
+        for file in dataset.files:
+            print(f" - {file}")
+
     return dataloader
 
 

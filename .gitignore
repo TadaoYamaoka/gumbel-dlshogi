@@ -2,5 +2,5 @@ __pycache__
 *.egg-info
 .vscode
 *.pt
-training_data
+training_data*
 *.pth
