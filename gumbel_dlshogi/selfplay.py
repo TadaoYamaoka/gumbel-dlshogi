@@ -135,12 +135,20 @@ class Actor:
                 self.policy_outputs = []
 
 
-def write_training_data(queue: Queue, output_dir: str, num_positions: int):
+def write_training_data(
+    queue: Queue, output_dir: str, num_positions: int, skip_max_moves: bool = False
+):
     os.makedirs(output_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     filename = f"{timestamp}.data"
     filepath = os.path.join(output_dir, filename)
+
+    nyugyoku_count = 0
+    draw_count = 0
+    max_moves_count = 0
+    total_moves = 0
+    total_games = 0
 
     with tqdm(total=num_positions, unit="pos") as pbar:
         while pbar.n < num_positions:
@@ -158,8 +166,16 @@ def write_training_data(queue: Queue, output_dir: str, num_positions: int):
                     result = BLACK_WIN
                 else:
                     result = WHITE_WIN
+                if training_data.is_nyugyoku:
+                    nyugyoku_count += 1
             else:
                 result = DRAW
+                if training_data.is_draw == REPETITION_DRAW:
+                    draw_count += 1
+                else:  # max_moves
+                    max_moves_count += 1
+                    if skip_max_moves:
+                        continue
 
             data = np.empty(len(training_data.policy_outputs), dtype=dtypeTrainingData)
             for i, (hcp, policy_output) in enumerate(
@@ -172,7 +188,19 @@ def write_training_data(queue: Queue, output_dir: str, num_positions: int):
             with open(filepath, "ab") as f:
                 data.tofile(f)
 
+            total_moves += len(training_data.policy_outputs)
+            total_games += 1
+
             pbar.update(len(training_data.policy_outputs))
+            pbar.set_postfix(
+                {
+                    "Games": total_games,
+                    "AverageMoves": total_moves / total_games,
+                    "Nyugyoku": nyugyoku_count,
+                    "Draw": draw_count,
+                    "MaxMoves": max_moves_count,
+                }
+            )
 
 
 def selfplay(
@@ -183,6 +211,7 @@ def selfplay(
     output_dir,
     num_positions,
     amp,
+    skip_max_moves=False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = torch.jit.load(model_path)
@@ -193,7 +222,9 @@ def selfplay(
 
     queue = Queue()
     writer_thread = threading.Thread(
-        target=write_training_data, args=(queue, output_dir, num_positions), daemon=True
+        target=write_training_data,
+        args=(queue, output_dir, num_positions, skip_max_moves),
+        daemon=True,
     )
     writer_thread.start()
 
@@ -294,6 +325,7 @@ def selfplay_multiprocess(
     num_positions,
     amp,
     num_processes,
+    skip_max_moves=False,
 ):
     """マルチプロセスで自己対局を実行する"""
     import multiprocessing as mp
@@ -304,7 +336,8 @@ def selfplay_multiprocess(
     lock = mp.Lock()
 
     writer_process = mp.Process(
-        target=write_training_data, args=(queue, output_dir, num_positions)
+        target=write_training_data,
+        args=(queue, output_dir, num_positions, skip_max_moves),
     )
     writer_process.start()
 
@@ -361,7 +394,11 @@ if __name__ == "__main__":
         default=0,
         help="Number of self-play processes. If 0, run in single process mode.",
     )
-
+    parser.add_argument(
+        "--skip_max_moves",
+        action="store_true",
+        help="Skip training data when game ends due to maximum moves limit",
+    )
     args = parser.parse_args()
 
     if args.num_processes > 0:
@@ -374,6 +411,7 @@ if __name__ == "__main__":
             args.num_positions,
             args.amp,
             args.num_processes,
+            args.skip_max_moves,
         )
     else:
         selfplay(
