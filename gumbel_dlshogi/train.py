@@ -137,10 +137,11 @@ def evaluate(model, dataloader, device, amp_enabled=True):
     }
 
 
-def save_checkpoint(model, optimizer, scaler, epoch, loss, filepath):
+def save_checkpoint(model, optimizer, scaler, epoch, total_steps, loss, filepath):
     """Save training checkpoint"""
     checkpoint = {
         "epoch": epoch,
+        "total_steps": total_steps,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
@@ -157,9 +158,12 @@ def load_checkpoint(filepath, model, optimizer, scaler, device):
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scaler.load_state_dict(checkpoint["scaler_state_dict"])
     epoch = checkpoint["epoch"]
+    total_steps = checkpoint["total_steps"]
     loss = checkpoint["loss"]
-    print(f"Checkpoint loaded from {filepath}, epoch {epoch}, loss {loss:.4f}")
-    return epoch, loss
+    print(
+        f"Checkpoint loaded from {filepath}, epoch {epoch}, steps {total_steps}, loss {loss:.4f}"
+    )
+    return epoch, total_steps
 
 
 def load_initial_model(filepath, model, device):
@@ -220,8 +224,11 @@ def train(args):
 
     # Resume from checkpoint if specified
     start_epoch = 0
+    total_steps = 0
     if args.resume:
-        start_epoch, _ = load_checkpoint(args.resume, model, optimizer, scaler, device)
+        start_epoch, total_steps = load_checkpoint(
+            args.resume, model, optimizer, scaler, device
+        )
         start_epoch += 1
 
     max_epochs = start_epoch + args.epochs
@@ -241,11 +248,15 @@ def train(args):
         )
         train_time = time.time() - start_time
 
+        # Update total steps
+        total_steps += len(train_dataloader)
+
         print(
             f"Train - Loss: {train_metrics['total_loss']:.4f}, "
             f"Policy Loss: {train_metrics['policy_loss']:.4f}, "
             f"Value Loss: {train_metrics['value_loss']:.4f}, "
-            f"Time: {train_time:.2f}s"
+            f"Time: {train_time:.2f}s, "
+            f"Total Steps: {total_steps}"
         )
 
         # Evaluation
@@ -271,6 +282,7 @@ def train(args):
                 optimizer,
                 scaler,
                 epoch,
+                total_steps,
                 train_metrics["total_loss"],
                 checkpoint_path,
             )
