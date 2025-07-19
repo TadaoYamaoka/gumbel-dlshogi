@@ -448,5 +448,6 @@ if __name__ == "__main__":
             args.output_dir,
             args.num_positions,
             args.amp,
+            args.skip_max_moves,
             debug=args.debug,
         )
