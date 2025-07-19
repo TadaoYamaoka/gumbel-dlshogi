@@ -17,6 +17,7 @@ from cshogi import (
     WHITE_WIN,
     Board,
     HuffmanCodedPos,
+    move_to_usi,
 )
 from pydlshogi2.features import (
     FEATURES_NUM,
@@ -59,13 +60,16 @@ def _get_invalid_actions(board: Board) -> np.ndarray:
 
 
 class Actor:
-    def __init__(self, max_num_considered_actions, num_simulations, queue: Queue):
+    def __init__(
+        self, max_num_considered_actions, num_simulations, queue: Queue, debug=False
+    ):
         self.board = Board()
         self.max_num_considered_actions = max_num_considered_actions
         self.num_simulations = num_simulations
         self.step = None
         self.generator = None
         self.queue = queue
+        self.debug = debug
 
         self.hcps = np.empty(MAX_MOVES, dtype=HuffmanCodedPos)
         self.policy_outputs = []
@@ -122,6 +126,10 @@ class Actor:
                 or (is_max_moves := self.board.move_number >= MAX_MOVES)
                 or (is_mate_in_3ply := self.board.mate_move(3) != 0)
             ):
+                if self.debug:
+                    print(
+                        f"startpos moves {' '.join(move_to_usi(move) for move in self.board.history)}"
+                    )
                 self.queue.put(
                     TrainingData(
                         hcps=self.hcps[: len(self.policy_outputs)].copy(),
@@ -220,6 +228,7 @@ def selfplay(
     num_positions,
     amp,
     skip_max_moves=False,
+    debug=False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = torch.jit.load(model_path)
@@ -237,7 +246,7 @@ def selfplay(
     writer_thread.start()
 
     actors = [
-        Actor(max_num_considered_actions, num_simulations, queue)
+        Actor(max_num_considered_actions, num_simulations, queue, debug)
         for _ in range(batch_size)
     ]
 
@@ -281,6 +290,7 @@ def selfplay_worker_mp(
     num_simulations,
     queue,
     amp,
+    debug,
 ):
     """マルチプロセス用の自己対局ワーカー"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -291,7 +301,7 @@ def selfplay_worker_mp(
     init_table(max_num_considered_actions, num_simulations)
 
     actors = [
-        Actor(max_num_considered_actions, num_simulations, queue)
+        Actor(max_num_considered_actions, num_simulations, queue, debug)
         for _ in range(batch_size)
     ]
 
@@ -334,6 +344,7 @@ def selfplay_multiprocess(
     amp,
     num_processes,
     skip_max_moves=False,
+    debug=False,
 ):
     """マルチプロセスで自己対局を実行する"""
     import multiprocessing as mp
@@ -361,6 +372,7 @@ def selfplay_multiprocess(
                 num_simulations,
                 queue,
                 amp,
+                debug,
             ),
             daemon=True,
         )
@@ -407,6 +419,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip training data when game ends due to maximum moves limit",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode for additional logging",
+    )
     args = parser.parse_args()
 
     if args.num_processes > 0:
@@ -420,6 +437,7 @@ if __name__ == "__main__":
             args.amp,
             args.num_processes,
             args.skip_max_moves,
+            debug=args.debug,
         )
     else:
         selfplay(
@@ -430,4 +448,5 @@ if __name__ == "__main__":
             args.output_dir,
             args.num_positions,
             args.amp,
+            debug=args.debug,
         )
