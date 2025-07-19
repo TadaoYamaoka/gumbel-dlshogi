@@ -182,60 +182,76 @@ def save_torchscript_model(model, filepath):
     print(f"TorchScript model saved to {filepath}")
 
 
-def train(args):
+def train(
+    train_dir,
+    test_file,
+    num_files,
+    blocks,
+    channels,
+    fcl,
+    initial_model,
+    epochs,
+    batch_size,
+    eval_batch_size,
+    lr,
+    weight_decay,
+    num_workers,
+    amp,
+    checkpoint_dir,
+    resume,
+    save_interval,
+    eval_interval,
+    save_torchscript,
+):
     """Main training function"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # Create model
-    model = PolicyValueNetwork(
-        blocks=args.blocks, channels=args.channels, fcl=args.fcl
-    ).to(device)
+    model = PolicyValueNetwork(blocks=blocks, channels=channels, fcl=fcl).to(device)
 
     # Load initial model if specified
-    if args.initial_model:
-        load_initial_model(args.initial_model, model, device)
+    if initial_model:
+        load_initial_model(initial_model, model, device)
 
     # Create optimizer
-    optimizer = optim.Adam(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # Create gradient scaler for mixed precision
-    scaler = GradScaler(enabled=args.amp)
+    scaler = GradScaler(enabled=amp)
 
     # Create data loaders
     train_dataloader = create_dataloader(
-        args.train_dir,
-        batch_size=args.batch_size,
-        num_files=args.num_files,
-        num_workers=args.num_workers,
+        train_dir,
+        batch_size=batch_size,
+        num_files=num_files,
+        num_workers=num_workers,
         shuffle=True,
     )
 
     test_dataloader = None
-    if args.test_file:
+    if test_file:
         test_dataloader = create_test_dataloader(
-            args.test_file,
-            batch_size=args.eval_batch_size,
-            num_workers=args.num_workers,
+            test_file,
+            batch_size=eval_batch_size,
+            num_workers=num_workers,
             shuffle=False,
         )
 
     # Resume from checkpoint if specified
     start_epoch = 0
     total_steps = 0
-    if args.resume:
+    if resume:
         start_epoch, total_steps = load_checkpoint(
-            args.resume, model, optimizer, scaler, device
+            resume, model, optimizer, scaler, device
         )
         start_epoch += 1
 
-    max_epochs = start_epoch + args.epochs
+    max_epochs = start_epoch + epochs
 
     # Create checkpoint directory
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir_path = Path(checkpoint_dir)
+    checkpoint_dir_path.mkdir(parents=True, exist_ok=True)
 
     # Training loop
     for epoch in range(start_epoch, max_epochs):
@@ -244,7 +260,7 @@ def train(args):
         # Training
         start_time = time.time()
         train_metrics = train_epoch(
-            model, train_dataloader, optimizer, scaler, device, args.amp
+            model, train_dataloader, optimizer, scaler, device, amp
         )
         train_time = time.time() - start_time
 
@@ -260,9 +276,9 @@ def train(args):
         )
 
         # Evaluation
-        if test_dataloader and (epoch + 1) % args.eval_interval == 0:
+        if test_dataloader and (epoch + 1) % eval_interval == 0:
             start_time = time.time()
-            eval_metrics = evaluate(model, test_dataloader, device, args.amp)
+            eval_metrics = evaluate(model, test_dataloader, device, amp)
             eval_time = time.time() - start_time
 
             print(
@@ -275,8 +291,10 @@ def train(args):
             )
 
         # Save checkpoint
-        if (epoch + 1) % args.save_interval == 0 or epoch == max_epochs - 1:
-            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1:03d}.pth"
+        if (epoch + 1) % save_interval == 0 or epoch == max_epochs - 1:
+            checkpoint_path = (
+                checkpoint_dir_path / f"checkpoint_epoch_{epoch + 1:03d}.pth"
+            )
             save_checkpoint(
                 model,
                 optimizer,
@@ -288,8 +306,8 @@ def train(args):
             )
 
     # Save TorchScript model if requested
-    if args.save_torchscript:
-        save_torchscript_model(model, args.save_torchscript)
+    if save_torchscript:
+        save_torchscript_model(model, save_torchscript)
 
 
 def main():
@@ -358,7 +376,27 @@ def main():
     )
 
     args = parser.parse_args()
-    train(args)
+    train(
+        train_dir=args.train_dir,
+        test_file=args.test_file,
+        num_files=args.num_files,
+        blocks=args.blocks,
+        channels=args.channels,
+        fcl=args.fcl,
+        initial_model=args.initial_model,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        eval_batch_size=args.eval_batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        num_workers=args.num_workers,
+        amp=args.amp,
+        checkpoint_dir=args.checkpoint_dir,
+        resume=args.resume,
+        save_interval=args.save_interval,
+        eval_interval=args.eval_interval,
+        save_torchscript=args.save_torchscript,
+    )
 
 
 if __name__ == "__main__":
