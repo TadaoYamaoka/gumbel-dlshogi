@@ -40,6 +40,7 @@ class TrainingData:
     hcps: np.ndarray
     policy_outputs: list[base.PolicyOutput]
     turn: int
+    is_mate_in_3ply: bool
     is_game_over: bool
     is_nyugyoku: bool
     is_draw: int
@@ -112,18 +113,21 @@ class Actor:
             is_nyugyoku = False
             is_draw = NOT_REPETITION
             is_max_moves = False
+            is_mate_in_3ply = False
             if (
                 (is_game_over := self.board.is_game_over())
                 or (is_nyugyoku := self.board.is_nyugyoku())
                 or (is_draw := self.board.is_draw())
                 in (REPETITION_DRAW, REPETITION_WIN, REPETITION_LOSE)
                 or (is_max_moves := self.board.move_number >= MAX_MOVES)
+                or (is_mate_in_3ply := self.board.mate_move(3) != 0)
             ):
                 self.queue.put(
                     TrainingData(
                         hcps=self.hcps[: len(self.policy_outputs)].copy(),
                         policy_outputs=self.policy_outputs,
                         turn=self.board.turn,
+                        is_mate_in_3ply=is_mate_in_3ply,
                         is_game_over=is_game_over,
                         is_nyugyoku=is_nyugyoku,
                         is_draw=is_draw,
@@ -156,18 +160,22 @@ def write_training_data(
             if training_data is None:
                 break
 
-            if training_data.is_game_over or training_data.is_draw == REPETITION_LOSE:
-                if training_data.turn == BLACK:
-                    result = WHITE_WIN
-                else:
-                    result = BLACK_WIN
-            elif training_data.is_nyugyoku or training_data.is_draw == REPETITION_WIN:
+            if (
+                training_data.is_mate_in_3ply
+                or training_data.is_nyugyoku
+                or training_data.is_draw == REPETITION_WIN
+            ):
                 if training_data.turn == BLACK:
                     result = BLACK_WIN
                 else:
                     result = WHITE_WIN
                 if training_data.is_nyugyoku:
                     nyugyoku_count += 1
+            elif training_data.is_game_over or training_data.is_draw == REPETITION_LOSE:
+                if training_data.turn == BLACK:
+                    result = WHITE_WIN
+                else:
+                    result = BLACK_WIN
             else:
                 result = DRAW
                 if training_data.is_draw == REPETITION_DRAW:
