@@ -295,7 +295,8 @@ def selfplay_worker_mp(
     """マルチプロセス用の自己対局ワーカー"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = torch.jit.load(model_path)
-    model.to(device)
+    with lock:
+        model.to(device)
     model.eval()
 
     init_table(max_num_considered_actions, num_simulations)
