@@ -349,7 +349,10 @@ def selfplay_multiprocess(
     """マルチプロセスで自己対局を実行する"""
     import multiprocessing as mp
 
-    mp.set_start_method("spawn")
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass  # context has already been set
 
     queue = mp.Manager().Queue()
     lock = mp.Lock()

@@ -3,4 +3,5 @@ __pycache__
 .vscode
 *.pt
 training_data*
+*.data
 *.pth
