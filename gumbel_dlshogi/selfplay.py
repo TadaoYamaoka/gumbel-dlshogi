@@ -284,6 +284,7 @@ def selfplay(
 
 def selfplay_worker_mp(
     lock,
+    stop_event,
     model_path,
     batch_size,
     max_num_considered_actions,
@@ -314,7 +315,7 @@ def selfplay_worker_mp(
     )
     input_features = torch_features.numpy()
 
-    while True:
+    while not stop_event.is_set():
         for i, actor in enumerate(actors):
             actor.next()
             make_input_features(actor.board, input_features[i])
@@ -357,6 +358,7 @@ def selfplay_multiprocess(
 
     queue = mp.Manager().Queue()
     lock = mp.Lock()
+    stop_event = mp.Event()
 
     writer_process = mp.Process(
         target=write_training_data,
@@ -370,6 +372,7 @@ def selfplay_multiprocess(
             target=selfplay_worker_mp,
             args=(
                 lock,
+                stop_event,
                 model_path,
                 batch_size,
                 max_num_considered_actions,
@@ -389,13 +392,13 @@ def selfplay_multiprocess(
     except KeyboardInterrupt:
         print("\nTerminating self-play processes.")
     finally:
+        stop_event.set()  # 全プロセスに終了を通知
+
         for p in processes:
-            if p.is_alive():
-                p.terminate()
             p.join()
         if writer_process.is_alive():
-            writer_process.terminate()
-        writer_process.join()
+            queue.put(None)
+            writer_process.join()
         print("All processes terminated.")
 
 
