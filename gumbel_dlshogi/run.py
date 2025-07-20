@@ -1,8 +1,37 @@
 import argparse
+import collections
 from pathlib import Path
 
 from gumbel_dlshogi.selfplay import selfplay_multiprocess
 from gumbel_dlshogi.train import train
+
+
+def parse_schedule(schedule_str):
+    """Parses a schedule string like "1:100,10:200" into a sorted dict."""
+    if not schedule_str:
+        return None
+    try:
+        schedule = collections.OrderedDict()
+        for item in schedule_str.split(","):
+            cycle, value = item.split(":")
+            schedule[int(cycle)] = int(value)
+        # Sort by cycle number
+        return collections.OrderedDict(sorted(schedule.items()))
+    except ValueError:
+        raise ValueError(f"Invalid schedule format: {schedule_str}")
+
+
+def get_scheduled_value(cycle, base_value, schedule):
+    """Gets the value for the current cycle based on the schedule."""
+    if not schedule:
+        return base_value
+    current_value = base_value
+    for scheduled_cycle, value in schedule.items():
+        if cycle >= scheduled_cycle:
+            current_value = value
+        else:
+            break
+    return current_value
 
 
 def main():
@@ -62,7 +91,29 @@ def main():
     parser.add_argument("--channels", type=int, default=192)
     parser.add_argument("--fcl", type=int, default=256)
 
+    # Schedule arguments
+    parser.add_argument(
+        "--num_simulations_schedule",
+        type=str,
+        help='Schedule for num_simulations, e.g., "10:32,100:64,1000:128"',
+    )
+    parser.add_argument(
+        "--num_files_schedule",
+        type=str,
+        help='Schedule for num_files, e.g., "10:2,100:4,1000:8"',
+    )
+    parser.add_argument(
+        "--train_batch_size_schedule",
+        type=str,
+        help='Schedule for train_batch_size, e.g., "10:512,100:1024,1000:2048"',
+    )
+
     args = parser.parse_args()
+
+    # Parse schedules
+    num_simulations_schedule = parse_schedule(args.num_simulations_schedule)
+    num_files_schedule = parse_schedule(args.num_files_schedule)
+    train_batch_size_schedule = parse_schedule(args.train_batch_size_schedule)
 
     workspace = Path(args.workspace)
     models_dir = workspace / "models"
@@ -88,14 +139,31 @@ def main():
         latest_model_path = str(resume_model_path)
 
     for cycle in range(args.start_cycle - 1, args.cycles):
-        print(f"--- Starting Cycle {cycle + 1}/{args.cycles} ---")
+        current_cycle_num = cycle + 1
+        print(f"--- Starting Cycle {current_cycle_num}/{args.cycles} ---")
+
+        # Get scheduled parameters for the current cycle
+        num_simulations = get_scheduled_value(
+            current_cycle_num, args.num_simulations, num_simulations_schedule
+        )
+        num_files = get_scheduled_value(
+            current_cycle_num, args.num_files, num_files_schedule
+        )
+        train_batch_size = get_scheduled_value(
+            current_cycle_num, args.train_batch_size, train_batch_size_schedule
+        )
+        if num_simulations_schedule or num_files_schedule or train_batch_size_schedule:
+            print(f"Current parameters for cycle {current_cycle_num}:")
+            print(f"  num_simulations: {num_simulations}")
+            print(f"  num_files: {num_files}")
+            print(f"  train_batch_size: {train_batch_size}")
 
         # --- Self-play Phase ---
         selfplay_multiprocess(
             model_path=latest_model_path,
             batch_size=args.selfplay_batch_size,
             max_num_considered_actions=args.max_num_considered_actions,
-            num_simulations=args.num_simulations,
+            num_simulations=num_simulations,
             output_dir=str(data_dir),
             num_positions=args.num_positions,
             amp=args.selfplay_amp,
@@ -127,13 +195,13 @@ def main():
         train(
             train_dir=str(data_dir),
             test_file=args.test_file,
-            num_files=args.num_files,
+            num_files=num_files,
             blocks=args.blocks,
             channels=args.channels,
             fcl=args.fcl,
             initial_model=initial_model_state,
             epochs=args.train_epochs,
-            batch_size=args.train_batch_size,
+            batch_size=train_batch_size,
             eval_batch_size=args.eval_batch_size,
             lr=args.lr,
             weight_decay=args.weight_decay,
