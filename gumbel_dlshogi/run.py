@@ -67,6 +67,7 @@ def main():
     workspace = Path(args.workspace)
     models_dir = workspace / "models"
     data_dir = workspace / "data"
+    log_dir = workspace / "logs"
     models_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -104,7 +105,7 @@ def main():
 
         # --- Training Phase ---
         print("--- Training Phase ---")
-        checkpoint_dir = models_dir / f"checkpoints"
+        checkpoint_dir = workspace / f"checkpoints"
         checkpoint_dir.mkdir(exist_ok=True)
 
         next_model_path = models_dir / f"model_{cycle + 1:08d}.pt"
@@ -139,6 +140,7 @@ def main():
             num_workers=args.train_num_workers,
             amp=args.train_amp,
             checkpoint_dir=str(checkpoint_dir),
+            log_dir=str(log_dir),
             resume=resume_path,
             save_interval=args.save_interval,
             eval_interval=args.eval_interval,

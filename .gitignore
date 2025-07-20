@@ -5,3 +5,4 @@ __pycache__
 training_data*
 *.data
 *.pth
+logs/

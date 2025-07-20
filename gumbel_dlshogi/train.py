@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from pydlshogi2.network.policy_value_resnet import PolicyValueNetwork
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from gumbel_dlshogi.data_loader import create_dataloader, create_test_dataloader
@@ -198,6 +199,7 @@ def train(
     num_workers,
     amp,
     checkpoint_dir,
+    log_dir,
     resume,
     save_interval,
     eval_interval,
@@ -206,6 +208,17 @@ def train(
     """Main training function"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    # Create checkpoint directory
+    checkpoint_dir_path = Path(checkpoint_dir)
+    checkpoint_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Create SummaryWriter if log_dir is specified
+    writer = None
+    if log_dir:
+        log_dir_path = Path(log_dir)
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=log_dir_path)
 
     # Create model
     model = PolicyValueNetwork(blocks=blocks, channels=channels, fcl=fcl).to(device)
@@ -275,6 +288,18 @@ def train(
             f"Total Steps: {total_steps}"
         )
 
+        # Log training metrics to TensorBoard
+        if writer:
+            writer.add_scalar(
+                "Train/Total Loss", train_metrics["total_loss"], total_steps
+            )
+            writer.add_scalar(
+                "Train/Policy Loss", train_metrics["policy_loss"], total_steps
+            )
+            writer.add_scalar(
+                "Train/Value Loss", train_metrics["value_loss"], total_steps
+            )
+
         # Evaluation
         if test_dataloader and (epoch + 1) % eval_interval == 0:
             start_time = time.time()
@@ -289,6 +314,24 @@ def train(
                 f"Value Acc: {eval_metrics['value_accuracy']:.4f}, "
                 f"Time: {eval_time:.2f}s"
             )
+
+            # Log evaluation metrics to TensorBoard
+            if writer:
+                writer.add_scalar(
+                    "Eval/Total Loss", eval_metrics["total_loss"], total_steps
+                )
+                writer.add_scalar(
+                    "Eval/Policy Loss", eval_metrics["policy_loss"], total_steps
+                )
+                writer.add_scalar(
+                    "Eval/Value Loss", eval_metrics["value_loss"], total_steps
+                )
+                writer.add_scalar(
+                    "Eval/Policy Accuracy", eval_metrics["policy_accuracy"], total_steps
+                )
+                writer.add_scalar(
+                    "Eval/Value Accuracy", eval_metrics["value_accuracy"], total_steps
+                )
 
         # Save checkpoint
         if (epoch + 1) % save_interval == 0 or epoch == max_epochs - 1:
@@ -308,6 +351,9 @@ def train(
     # Save TorchScript model if requested
     if save_torchscript:
         save_torchscript_model(model, save_torchscript)
+
+    if writer:
+        writer.close()
 
 
 def main():
@@ -361,6 +407,11 @@ def main():
         default="checkpoints",
         help="Directory to save checkpoints",
     )
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        help="Directory to save TensorBoard logs",
+    )
     parser.add_argument("--resume", type=str, help="Resume from checkpoint")
     parser.add_argument(
         "--save_interval", type=int, default=10, help="Save checkpoint every N epochs"
@@ -392,6 +443,7 @@ def main():
         num_workers=args.num_workers,
         amp=args.amp,
         checkpoint_dir=args.checkpoint_dir,
+        log_dir=args.log_dir,
         resume=args.resume,
         save_interval=args.save_interval,
         eval_interval=args.eval_interval,
