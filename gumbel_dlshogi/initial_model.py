@@ -11,12 +11,21 @@ def create_initial_model(blocks=10, channels=192, fcl=256):
     return model
 
 
-def save_torchscript_model(model, output_path, input_shape=(1, 119, 9, 9)):
+def save_torchscript_model(model, output_path):
     """Save model as TorchScript"""
     model.eval()
 
+    class PolicyValueNetworkAddSigmoid(torch.nn.Module):
+        def __init__(self, model):
+            super(PolicyValueNetworkAddSigmoid, self).__init__()
+            self.base_model = model
+
+        def forward(self, x):
+            y1, y2 = self.base_model(x)
+            return y1, torch.sigmoid(y2)
+
     # Script the model
-    scripted_model = torch.jit.script(model)
+    scripted_model = torch.jit.script(PolicyValueNetworkAddSigmoid(model))
 
     # Save the scripted model
     scripted_model.save(output_path)

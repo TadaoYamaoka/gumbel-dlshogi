@@ -178,7 +178,16 @@ def save_torchscript_model(model, filepath):
     """Save model as TorchScript"""
     model.eval()
 
-    scripted_model = torch.jit.script(model)
+    class PolicyValueNetworkAddSigmoid(torch.nn.Module):
+        def __init__(self, model):
+            super(PolicyValueNetworkAddSigmoid, self).__init__()
+            self.base_model = model
+
+        def forward(self, x):
+            y1, y2 = self.base_model(x)
+            return y1, torch.sigmoid(y2)
+
+    scripted_model = torch.jit.script(PolicyValueNetworkAddSigmoid(model))
     scripted_model.save(filepath)
     print(f"TorchScript model saved to {filepath}")
 
