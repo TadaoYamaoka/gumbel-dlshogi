@@ -294,10 +294,10 @@ def train(
 
             writer.add_scalar("train/loss", train_metrics["total_loss"], total_steps)
             writer.add_scalar(
-                "train/policy loss", train_metrics["policy_loss"], total_steps
+                "train/policy_loss", train_metrics["policy_loss"], total_steps
             )
             writer.add_scalar(
-                "train/value loss", train_metrics["value_loss"], total_steps
+                "train/value_loss", train_metrics["value_loss"], total_steps
             )
 
         # Evaluation
@@ -319,16 +319,16 @@ def train(
             if writer:
                 writer.add_scalar("val/loss", eval_metrics["total_loss"], total_steps)
                 writer.add_scalar(
-                    "val/policy loss", eval_metrics["policy_loss"], total_steps
+                    "val/policy_loss", eval_metrics["policy_loss"], total_steps
                 )
                 writer.add_scalar(
-                    "val/value loss", eval_metrics["value_loss"], total_steps
+                    "val/value_loss", eval_metrics["value_loss"], total_steps
                 )
                 writer.add_scalar(
-                    "val/policy accuracy", eval_metrics["policy_accuracy"], total_steps
+                    "val/policy_accuracy", eval_metrics["policy_accuracy"], total_steps
                 )
                 writer.add_scalar(
-                    "val/value accuracy", eval_metrics["value_accuracy"], total_steps
+                    "val/value_accuracy", eval_metrics["value_accuracy"], total_steps
                 )
 
         # Save checkpoint
