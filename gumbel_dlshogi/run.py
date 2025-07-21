@@ -180,6 +180,16 @@ def main():
             for key, value in selfplay_stats.items():
                 print(f"  {key}: {value}")
                 writer.add_scalar(f"selfplay/{key}", value, current_cycle_num)
+
+            # Log the parameters used for this cycle
+            writer.add_scalar(
+                "selfplay/num_simulations", num_simulations, current_cycle_num
+            )
+            writer.add_scalar("selfplay/num_files", num_files, current_cycle_num)
+            writer.add_scalar(
+                "selfplay/train_batch_size", train_batch_size, current_cycle_num
+            )
+
             writer.close()
 
         # --- Training Phase ---
