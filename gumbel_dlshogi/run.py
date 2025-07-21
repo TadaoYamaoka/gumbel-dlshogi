@@ -2,6 +2,8 @@ import argparse
 import collections
 from pathlib import Path
 
+from torch.utils.tensorboard import SummaryWriter
+
 from gumbel_dlshogi.selfplay import selfplay_multiprocess
 from gumbel_dlshogi.train import train
 
@@ -159,7 +161,7 @@ def main():
             print(f"  train_batch_size: {train_batch_size}")
 
         # --- Self-play Phase ---
-        selfplay_multiprocess(
+        selfplay_stats = selfplay_multiprocess(
             model_path=latest_model_path,
             batch_size=args.selfplay_batch_size,
             max_num_considered_actions=args.max_num_considered_actions,
@@ -170,6 +172,15 @@ def main():
             num_processes=args.num_processes,
             skip_max_moves=args.skip_max_moves,
         )
+
+        # Log self-play stats to TensorBoard
+        if selfplay_stats:
+            print("--- Self-play Stats ---")
+            writer = SummaryWriter(log_dir=str(log_dir))
+            for key, value in selfplay_stats.items():
+                print(f"  {key}: {value}")
+                writer.add_scalar(f"selfplay/{key}", value, current_cycle_num)
+            writer.close()
 
         # --- Training Phase ---
         print("--- Training Phase ---")

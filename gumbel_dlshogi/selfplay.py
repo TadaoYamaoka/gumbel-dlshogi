@@ -148,7 +148,11 @@ class Actor:
 
 
 def write_training_data(
-    queue: Queue, output_dir: str, num_positions: int, skip_max_moves: bool = False
+    queue: Queue,
+    output_dir: str,
+    num_positions: int,
+    skip_max_moves: bool = False,
+    stats_dict=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -217,6 +221,17 @@ def write_training_data(
                     "MaxMoves": max_moves_count,
                 }
             )
+
+    # Store final stats
+    if stats_dict is not None:
+        stats_dict["positions"] = total_moves
+        stats_dict["games"] = total_games
+        stats_dict["average_moves"] = (
+            total_moves / total_games if total_games > 0 else 0
+        )
+        stats_dict["nyugyoku_count"] = nyugyoku_count
+        stats_dict["draw_count"] = draw_count
+        stats_dict["max_moves_count"] = max_moves_count
 
 
 def selfplay(
@@ -356,13 +371,15 @@ def selfplay_multiprocess(
     except RuntimeError:
         pass  # context has already been set
 
-    queue = mp.Manager().Queue()
+    manager = mp.Manager()
+    queue = manager.Queue()
+    stats_dict = manager.dict()
     lock = mp.Lock()
     stop_event = mp.Event()
 
     writer_process = mp.Process(
         target=write_training_data,
-        args=(queue, output_dir, num_positions, skip_max_moves),
+        args=(queue, output_dir, num_positions, skip_max_moves, stats_dict),
     )
     writer_process.start()
 
@@ -400,6 +417,8 @@ def selfplay_multiprocess(
             queue.put(None)
             writer_process.join()
         print("All processes terminated.")
+
+    return dict(stats_dict)
 
 
 if __name__ == "__main__":
