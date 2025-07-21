@@ -290,14 +290,14 @@ def train(
 
         # Log training metrics to TensorBoard
         if writer:
+            writer.add_scalar("epoch", epoch, total_steps)
+
+            writer.add_scalar("train/loss", train_metrics["total_loss"], total_steps)
             writer.add_scalar(
-                "Train/Total Loss", train_metrics["total_loss"], total_steps
+                "train/policy loss", train_metrics["policy_loss"], total_steps
             )
             writer.add_scalar(
-                "Train/Policy Loss", train_metrics["policy_loss"], total_steps
-            )
-            writer.add_scalar(
-                "Train/Value Loss", train_metrics["value_loss"], total_steps
+                "train/value loss", train_metrics["value_loss"], total_steps
             )
 
         # Evaluation
@@ -317,20 +317,18 @@ def train(
 
             # Log evaluation metrics to TensorBoard
             if writer:
+                writer.add_scalar("val/loss", eval_metrics["total_loss"], total_steps)
                 writer.add_scalar(
-                    "Eval/Total Loss", eval_metrics["total_loss"], total_steps
+                    "val/policy loss", eval_metrics["policy_loss"], total_steps
                 )
                 writer.add_scalar(
-                    "Eval/Policy Loss", eval_metrics["policy_loss"], total_steps
+                    "val/value loss", eval_metrics["value_loss"], total_steps
                 )
                 writer.add_scalar(
-                    "Eval/Value Loss", eval_metrics["value_loss"], total_steps
+                    "val/policy accuracy", eval_metrics["policy_accuracy"], total_steps
                 )
                 writer.add_scalar(
-                    "Eval/Policy Accuracy", eval_metrics["policy_accuracy"], total_steps
-                )
-                writer.add_scalar(
-                    "Eval/Value Accuracy", eval_metrics["value_accuracy"], total_steps
+                    "val/value accuracy", eval_metrics["value_accuracy"], total_steps
                 )
 
         # Save checkpoint
