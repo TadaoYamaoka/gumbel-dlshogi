@@ -183,11 +183,15 @@ def main():
 
             # Log the parameters used for this cycle
             writer.add_scalar(
-                "selfplay/num_simulations", num_simulations, current_cycle_num
+                "parameters/selfplay/num_simulations",
+                num_simulations,
+                current_cycle_num,
             )
-            writer.add_scalar("selfplay/num_files", num_files, current_cycle_num)
             writer.add_scalar(
-                "selfplay/train_batch_size", train_batch_size, current_cycle_num
+                "parameters/training/num_files", num_files, current_cycle_num
+            )
+            writer.add_scalar(
+                "parameters/training/batch_size", train_batch_size, current_cycle_num
             )
 
             writer.close()
