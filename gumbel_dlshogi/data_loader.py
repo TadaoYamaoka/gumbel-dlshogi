@@ -62,8 +62,6 @@ class TrainingDataset(Dataset):
         # Create memory maps for files
         self._mmaps = {}
 
-        self._board = None
-
     def _get_mmap(self, file_path):
         """Get or create memory map for a file"""
         if file_path not in self._mmaps:
@@ -78,12 +76,6 @@ class TrainingDataset(Dataset):
             if global_idx < file_start + file_samples:
                 return file_path, global_idx - file_start
         raise IndexError(f"Index {global_idx} out of range")
-
-    def _get_board(self):
-        """Get or create a Board instance for HCP conversion"""
-        if self._board is None:
-            self._board = Board()
-        return self._board
 
     def __len__(self):
         return self.worker_total_samples
@@ -103,7 +95,7 @@ class TrainingDataset(Dataset):
         sample = mmap[local_offset]
 
         # Convert HCP to input features
-        board = self._get_board()
+        board = Board()
         board.set_hcp(np.asarray(sample["hcp"]))
 
         features = np.empty((FEATURES_NUM, 9, 9), dtype=np.float32)
@@ -155,7 +147,6 @@ def worker_init_fn(worker_id):
     dataset.end_idx = worker_dataset.end_idx
     dataset.worker_total_samples = worker_dataset.worker_total_samples
     dataset._mmaps = {}  # Each worker needs its own memory maps
-    dataset._board = None  # Reset the board for each worker
 
 
 def create_dataloader(
@@ -249,7 +240,6 @@ class TestDataset(Dataset):
             self.worker_total_samples = self.total_samples
 
         self._data = None  # Lazy initialization of memory map
-        self._board = None
 
     def _get_data(self):
         """Get or create memory map for the data file"""
@@ -258,12 +248,6 @@ class TestDataset(Dataset):
                 self.data_file, dtype=HuffmanCodedPosAndEval, mode="r"
             )
         return self._data
-
-    def _get_board(self):
-        """Get or create a Board instance for HCP conversion"""
-        if self._board is None:
-            self._board = Board()
-        return self._board
 
     def __len__(self):
         return self.worker_total_samples
@@ -280,7 +264,7 @@ class TestDataset(Dataset):
         sample = data[global_idx]
 
         # Convert HCP to input features
-        board = self._get_board()
+        board = Board()
         board.set_hcp(np.asarray(sample["hcp"]))
 
         features = np.empty((FEATURES_NUM, 9, 9), dtype=np.float32)
@@ -336,7 +320,6 @@ def test_worker_init_fn(worker_id):
     dataset.worker_total_samples = worker_dataset.worker_total_samples
     dataset.total_samples = worker_dataset.total_samples
     dataset._data = None  # Each worker needs its own memory map
-    dataset._board = None  # Reset the board for each worker
 
 
 def create_test_dataloader(
