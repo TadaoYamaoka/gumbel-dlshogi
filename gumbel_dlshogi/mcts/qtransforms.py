@@ -11,7 +11,7 @@ def softmax(x: np.ndarray) -> np.ndarray:
 def qtransform_completed_by_mix_value(
     tree: Tree,
     node_index: int,
-    value_scale: float = 0.1,
+    value_scale: float = 1.0,
     maxvisit_init: float = 50.0,
     epsilon: float = 1e-8,
 ):
