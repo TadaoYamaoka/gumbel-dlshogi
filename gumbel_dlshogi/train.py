@@ -1,11 +1,17 @@
 import argparse
+import os
+import random
+import socket
+import sys
 import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -21,8 +27,12 @@ from gumbel_dlshogi.network import (
     save_torchscript_model,
 )
 
+_NCCL_REQUIRED = "Training on 2 or more GPUs needs NCCL, which is available on Linux"
 
-def train_epoch(model, dataloader, optimizer, scaler, device, amp_enabled=True):
+
+def train_epoch(
+    model, dataloader, optimizer, scaler, device, amp_enabled=True, progress=True
+):
     """Train for one epoch"""
     model.train()
 
@@ -34,7 +44,8 @@ def train_epoch(model, dataloader, optimizer, scaler, device, amp_enabled=True):
     value_loss_sum = 0.0
     num_batches = 0
 
-    with tqdm(dataloader, desc="Training", unit="batch") as pbar:
+    pbar = tqdm(dataloader, desc="Training", unit="batch", disable=not progress)
+    with pbar:
         for features1, features2, policy_targets, value_targets in pbar:
             features1 = features1.to(device)
             features2 = features2.to(device)
@@ -149,6 +160,15 @@ def evaluate(model, dataloader, device, amp_enabled=True):
     }
 
 
+def _average_metrics(metrics, device):
+    """Averages the metrics of the processes in data parallel training."""
+    keys = sorted(metrics)
+    values = torch.tensor([metrics[key] for key in keys], device=device)
+    dist.all_reduce(values)
+    values /= dist.get_world_size()
+    return dict(zip(keys, values.tolist()))
+
+
 def save_checkpoint(model, optimizer, scaler, epoch, total_steps, loss, filepath):
     """Save training checkpoint"""
     checkpoint = {
@@ -206,20 +226,119 @@ def train(
     save_torchscript,
     use_nyugyoku_features=False,
     compile_options=None,
+    gpus=None,
 ):
     """Main training function
 
     Args:
+        batch_size: Batch size of a step. In data parallel training, each GPU trains
+            batch_size / len(gpus) samples of it.
         compile_options: If not None, the model is compiled with torch.compile by
             compile_model(**compile_options), e.g. {"backend": None, "mode": None}
+        gpus: CUDA device ids to train on. With 2 or more, the model is trained in
+            data parallel (DistributedDataParallel) by a process per GPU, which needs
+            NCCL (Linux). If None, the default device is used.
 
     Returns:
         The path of the checkpoint saved at the last epoch (None if no epoch ran).
     """
+    # The arguments of _train() (all but gpus)
+    params = {key: value for key, value in locals().items() if key != "gpus"}
+
+    if not gpus or len(gpus) == 1:
+        if gpus:
+            device = torch.device("cuda", gpus[0])
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return _train(0, 1, device, None, **params)
+
+    world_size = len(gpus)
+    if not dist.is_nccl_available():
+        raise ValueError(_NCCL_REQUIRED)
+    if batch_size % world_size:
+        raise ValueError(
+            f"The batch size {batch_size} is not divisible by the number of GPUs "
+            f"{world_size}"
+        )
+    # All processes shuffle the data with the same seed, and each takes its part
+    seed = random.randrange(2**31)
+    dist_init = (_find_free_port(), seed)
+    result = torch.multiprocessing.get_context("spawn").SimpleQueue()
+    torch.multiprocessing.spawn(
+        _train_worker,
+        args=(gpus, dist_init, result, params),
+        nprocs=world_size,
+        join=True,
+    )
+    return result.get()
+
+
+def _find_free_port():
+    """Returns a free TCP port of localhost to initialize the process group."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _train_worker(rank, gpus, dist_init, result, params):
+    """A process of data parallel training on gpus[rank]"""
+    port, seed = dist_init
+    world_size = len(gpus)
+    device = torch.device("cuda", gpus[rank])
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    if rank != 0:
+        # Only the first process prints the progress
+        sys.stdout = open(os.devnull, "w")
+    try:
+        checkpoint_path = _train(rank, world_size, device, seed, **params)
+        if rank == 0:
+            result.put(checkpoint_path)
+    finally:
+        dist.destroy_process_group()
+
+
+def _train(
+    rank,
+    world_size,
+    device,
+    seed,
+    *,
+    train_dir,
+    test_file,
+    num_files,
+    network,
+    initial_model,
+    epochs,
+    batch_size,
+    eval_batch_size,
+    lr,
+    weight_decay,
+    num_workers,
+    amp,
+    checkpoint_dir,
+    log_dir,
+    resume,
+    save_interval,
+    eval_interval,
+    save_torchscript,
+    use_nyugyoku_features,
+    compile_options,
+):
+    """Trains the model in a process (of world_size processes in data parallel).
+
+    The first process (rank 0) evaluates the model, saves it and writes the logs.
+    """
+    is_main = rank == 0
+    distributed = world_size > 1
     set_nyugyoku_features(use_nyugyoku_features)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Using device: {device}" + (f" x {world_size}" if distributed else ""))
 
     # Create checkpoint directory
     checkpoint_dir_path = Path(checkpoint_dir)
@@ -227,7 +346,7 @@ def train(
 
     # Create SummaryWriter if log_dir is specified
     writer = None
-    if log_dir:
+    if log_dir and is_main:
         log_dir_path = Path(log_dir)
         log_dir_path.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=log_dir_path)
@@ -239,39 +358,13 @@ def train(
     if initial_model:
         load_initial_model(initial_model, model, device)
 
-    # Train and evaluate with the compiled model. It shares the parameters with model,
-    # which is saved (the state dict of the compiled model has other names).
-    run_model = model
-    if compile_options is not None:
-        run_model = compile_model(model, device, **compile_options)
-
     # Create optimizer
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # Create gradient scaler for mixed precision
     scaler = GradScaler(device.type, enabled=amp)
 
-    # Create data loaders
-    train_dataloader = create_dataloader(
-        train_dir,
-        batch_size=batch_size,
-        num_files=num_files,
-        num_workers=num_workers,
-        shuffle=True,
-        use_nyugyoku_features=use_nyugyoku_features,
-    )
-
-    test_dataloader = None
-    if test_file:
-        test_dataloader = create_test_dataloader(
-            test_file,
-            batch_size=eval_batch_size,
-            num_workers=num_workers,
-            shuffle=False,
-            use_nyugyoku_features=use_nyugyoku_features,
-        )
-
-    # Resume from checkpoint if specified
+    # Resume from checkpoint if specified (all processes load the same state)
     start_epoch = 0
     total_steps = 0
     if resume:
@@ -280,18 +373,63 @@ def train(
         )
         start_epoch += 1
 
+    # Train with the model wrapped by DDP, which averages the gradients of the
+    # processes. model has the parameters and is saved (and evaluated by the first
+    # process, since a forward of DDP communicates in all processes).
+    run_model = model
+    if distributed:
+        run_model = DistributedDataParallel(model, device_ids=[device])
+    # Train and evaluate with the compiled model. It shares the parameters with model,
+    # which is saved (the state dict of the compiled model has other names).
+    if compile_options is not None:
+        run_model = compile_model(run_model, device, **compile_options)
+    eval_model = model if distributed else run_model
+
+    # Create data loaders
+    train_dataloader = create_dataloader(
+        train_dir,
+        batch_size=batch_size // world_size,
+        num_files=num_files,
+        num_workers=num_workers,
+        shuffle=True,
+        use_nyugyoku_features=use_nyugyoku_features,
+        num_replicas=world_size,
+        rank=rank,
+        seed=seed,
+    )
+
+    test_dataloader = None
+    if test_file and is_main:
+        test_dataloader = create_test_dataloader(
+            test_file,
+            batch_size=eval_batch_size,
+            num_workers=num_workers,
+            shuffle=False,
+            use_nyugyoku_features=use_nyugyoku_features,
+        )
+
     max_epochs = start_epoch + epochs
 
     # Training loop
     checkpoint_path = None
     for epoch in range(start_epoch, max_epochs):
         print(f"Epoch {epoch + 1}/{max_epochs}")
+        if distributed:
+            train_dataloader.sampler.set_epoch(epoch)
 
         # Training
         start_time = time.time()
         train_metrics = train_epoch(
-            run_model, train_dataloader, optimizer, scaler, device, amp
+            run_model,
+            train_dataloader,
+            optimizer,
+            scaler,
+            device,
+            amp,
+            progress=is_main,
         )
+        if distributed:
+            train_metrics = _average_metrics(train_metrics, device)
         train_time = time.time() - start_time
 
         # Update total steps
@@ -320,7 +458,7 @@ def train(
         # Evaluation
         if test_dataloader and (epoch + 1) % eval_interval == 0:
             start_time = time.time()
-            eval_metrics = evaluate(run_model, test_dataloader, device, amp)
+            eval_metrics = evaluate(eval_model, test_dataloader, device, amp)
             eval_time = time.time() - start_time
 
             print(
@@ -353,24 +491,55 @@ def train(
             checkpoint_path = (
                 checkpoint_dir_path / f"checkpoint_epoch_{epoch + 1:03d}.pth"
             )
-            save_checkpoint(
-                model,
-                optimizer,
-                scaler,
-                epoch,
-                total_steps,
-                train_metrics["total_loss"],
-                checkpoint_path,
-            )
+            if is_main:
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scaler,
+                    epoch,
+                    total_steps,
+                    train_metrics["total_loss"],
+                    checkpoint_path,
+                )
 
     # Save TorchScript model if requested
-    if save_torchscript:
+    if save_torchscript and is_main:
         save_torchscript_model(model, save_torchscript)
 
     if writer:
         writer.close()
 
     return checkpoint_path
+
+
+def gpu_ids(value):
+    """argparse type of a comma separated list of CUDA device ids, e.g. "0,1" """
+    try:
+        ids = [int(id) for id in value.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid GPU ids {value!r}, e.g. 0,1")
+    if len(set(ids)) != len(ids):
+        raise argparse.ArgumentTypeError(f"GPU ids {value!r} have duplicates")
+    if len(ids) > 1 and not dist.is_nccl_available():
+        raise argparse.ArgumentTypeError(_NCCL_REQUIRED)
+    count = torch.cuda.device_count()
+    invalid = [id for id in ids if not 0 <= id < count]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"GPU ids {invalid} are not available ({count} GPUs are found)"
+        )
+    return ids
+
+
+def add_gpus_argument(parser, name="--gpus"):
+    """Adds the argument of the GPUs to train on."""
+    parser.add_argument(
+        name,
+        type=gpu_ids,
+        help="Comma separated CUDA device ids to train on, e.g. 0,1. With 2 or more, "
+        "the model is trained in data parallel (the batch size is divided by them), "
+        "which needs NCCL (Linux).",
+    )
 
 
 def main():
@@ -408,8 +577,12 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument(
-        "--num_workers", type=int, default=0, help="Number of data loader workers"
+        "--num_workers",
+        type=int,
+        default=0,
+        help="Number of data loader workers (of each GPU in data parallel)",
     )
+    add_gpus_argument(parser)
 
     # Mixed precision
     parser.add_argument(
@@ -478,6 +651,7 @@ def main():
         save_torchscript=args.save_torchscript,
         use_nyugyoku_features=args.use_nyugyoku_features,
         compile_options=compile_options,
+        gpus=args.gpus,
     )
 
 

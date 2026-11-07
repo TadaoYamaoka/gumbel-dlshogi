@@ -4,7 +4,7 @@ import os
 import numpy as np
 import torch
 from cshogi import BLACK, BLACK_WIN, WHITE, WHITE_WIN, Board, HuffmanCodedPosAndEval
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from gumbel_dlshogi.common import (
     POLICY_FILE_EXT,
@@ -194,6 +194,9 @@ def create_dataloader(
     pin_memory=True,
     drop_last=True,
     use_nyugyoku_features=False,
+    num_replicas=1,
+    rank=0,
+    seed=0,
     **kwargs,
 ):
     """
@@ -207,6 +210,11 @@ def create_dataloader(
         shuffle: Whether to shuffle data
         pin_memory: Whether to pin memory for GPU transfer
         use_nyugyoku_features: Whether to use nyugyoku features
+        num_replicas: Number of processes of data parallel training. If more than 1,
+            each process loads its own part of the data by DistributedSampler, whose
+            set_epoch() must be called at each epoch to shuffle differently.
+        rank: Rank of the process in data parallel training
+        seed: Seed of the shuffle in data parallel training, the same in all processes
         **kwargs: Additional arguments for DataLoader
 
     Returns:
@@ -215,10 +223,22 @@ def create_dataloader(
     dataset = TrainingDataset(
         data_dir, num_files, use_nyugyoku_features=use_nyugyoku_features
     )
+    sampler = None
+    if num_replicas > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=drop_last,
+        )
+        shuffle = False
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=_collate_batch,
         pin_memory=pin_memory,

@@ -20,7 +20,7 @@ from gumbel_dlshogi.network import (
     resolve_compile_options,
 )
 from gumbel_dlshogi.selfplay import selfplay_multiprocess
-from gumbel_dlshogi.train import train
+from gumbel_dlshogi.train import add_gpus_argument, train
 
 
 def parse_schedule(schedule_str):
@@ -201,6 +201,7 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--train_num_workers", type=int, default=0)
+    add_gpus_argument(parser, "--train_gpus")
     parser.add_argument("--train_amp", action="store_true")
     parser.add_argument(
         "--train_compile",
@@ -251,6 +252,17 @@ def main():
     num_simulations_schedule = parse_schedule(args.num_simulations_schedule)
     num_files_schedule = parse_schedule(args.num_files_schedule)
     train_batch_size_schedule = parse_schedule(args.train_batch_size_schedule)
+    if args.train_gpus:
+        # Each GPU trains an equal part of the batch in data parallel training
+        batch_sizes = [args.train_batch_size]
+        if train_batch_size_schedule:
+            batch_sizes += train_batch_size_schedule.values()
+        invalid = [size for size in batch_sizes if size % len(args.train_gpus)]
+        if invalid:
+            parser.error(
+                f"The train batch sizes {invalid} are not divisible by the number of "
+                f"GPUs {len(args.train_gpus)}."
+            )
 
     workspace = Path(args.workspace)
     models_dir = workspace / "models"
@@ -447,6 +459,7 @@ def main():
             eval_interval=args.eval_interval,
             save_torchscript=str(next_model_path),
             compile_options=compile_options if args.train_compile else None,
+            gpus=args.train_gpus,
             **model_settings,
         )
         write_cycle_record(models_dir, cycle + 1, resume_checkpoint, model_settings)
