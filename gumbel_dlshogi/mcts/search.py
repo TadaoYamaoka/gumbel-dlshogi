@@ -100,6 +100,8 @@ def get_terminal_value(board: Board) -> Optional[np.float32]:
         return np.float32(0.0)
     if board.move_number >= MAX_MOVES:
         return np.float32(0.5)
+    if board.mate_move(3) != 0:
+        return np.float32(1.0)
     return None
 
 
