@@ -4,6 +4,7 @@ from pathlib import Path
 
 from torch.utils.tensorboard import SummaryWriter
 
+from gumbel_dlshogi.initial_model import check_model_state, create_initial_model
 from gumbel_dlshogi.selfplay import selfplay_multiprocess
 from gumbel_dlshogi.train import train
 
@@ -54,12 +55,13 @@ def main():
     parser.add_argument(
         "--initial_model",
         type=str,
-        help="Path to the initial model (.pt file).",
+        help="Path to the initial model (.pt file). If omitted when starting from "
+        "cycle 1, an initial model is created in the workspace.",
     )
     parser.add_argument(
         "--initial_model_state",
         type=str,
-        help="Path to the initial model state (.pth file).",
+        help="Path to the initial model state (.pth file) used with --initial_model.",
     )
     parser.add_argument(
         "--workspace",
@@ -129,11 +131,42 @@ def main():
     models_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    # Model settings shared by the initial model, its check and training
+    model_settings = {
+        "blocks": args.blocks,
+        "channels": args.channels,
+        "fcl": args.fcl,
+        "use_nyugyoku_features": args.use_nyugyoku_features,
+    }
+
     # Determine the starting model path
+    initial_model_state_path = None
     if args.start_cycle == 1:
-        if not args.initial_model:
-            parser.error("--initial_model is required when starting from cycle 1.")
-        latest_model_path = args.initial_model
+        initial_model_path = args.initial_model
+        initial_model_state_path = args.initial_model_state
+        if not initial_model_path:
+            if initial_model_state_path:
+                parser.error("--initial_model_state requires --initial_model.")
+            # Create the initial model with the same settings as self-play and training
+            initial_model_path = models_dir / "model_00000000.pt"
+            initial_model_state_path = initial_model_path.with_suffix(".pth")
+            if initial_model_path.exists() and initial_model_state_path.exists():
+                print(f"Using the existing initial model {initial_model_path}")
+            else:
+                create_initial_model(
+                    models_dir, initial_model_path.stem, **model_settings
+                )
+
+        # Check the initial weights against the settings before starting self-play
+        if initial_model_state_path:
+            try:
+                check_model_state(initial_model_state_path, **model_settings)
+            except ValueError as e:
+                parser.error(
+                    f"{e}. Use the same settings as the initial model, "
+                    "or remove it or use another workspace to create a new one."
+                )
+        latest_model_path = str(initial_model_path)
     else:
         # Resuming from a later cycle
         prev_cycle_num = args.start_cycle - 1
@@ -213,8 +246,8 @@ def main():
         initial_model_state = None
         resume_path = None
         if cycle == 0:
-            # For the very first cycle, use the initial model provided
-            initial_model_state = args.initial_model_state
+            # For the very first cycle, use the initial model
+            initial_model_state = initial_model_state_path
         else:
             # For subsequent cycles, resume from the last checkpoint of the previous cycle
             checkpoints = sorted(
@@ -227,9 +260,6 @@ def main():
             train_dir=str(data_dir),
             test_file=args.test_file,
             num_files=num_files,
-            blocks=args.blocks,
-            channels=args.channels,
-            fcl=args.fcl,
             initial_model=initial_model_state,
             epochs=args.train_epochs,
             batch_size=train_batch_size,
@@ -244,7 +274,7 @@ def main():
             save_interval=args.save_interval,
             eval_interval=args.eval_interval,
             save_torchscript=str(next_model_path),
-            use_nyugyoku_features=args.use_nyugyoku_features,
+            **model_settings,
         )
 
         latest_model_path = str(next_model_path)
