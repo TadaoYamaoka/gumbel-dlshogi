@@ -132,3 +132,11 @@ def save_torchscript_model(model, filepath):
     scripted_model = torch.jit.script(PolicyValueNetworkAddSigmoid(model))
     save_atomically(filepath, lambda path: scripted_model.save(str(path)))
     print(f"TorchScript model saved to {filepath}")
+
+
+def load_torchscript_state_dict(filepath):
+    """Returns the state dict of the network saved by save_torchscript_model."""
+    state_dict = torch.jit.load(str(filepath), map_location="cpu").state_dict()
+    # The network is saved in PolicyValueNetworkAddSigmoid
+    prefix = "base_model."
+    return {key.removeprefix(prefix): value for key, value in state_dict.items()}

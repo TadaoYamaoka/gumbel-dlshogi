@@ -4,6 +4,15 @@ import torch.nn as nn
 from gumbel_dlshogi.features import FEATURES1_NUM, MOVE_LABELS_NUM, MOVE_PLANES_NUM
 
 
+class Bias(nn.Module):
+    def __init__(self, shape):
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(shape))
+
+    def forward(self, x):
+        return x + self.bias
+
+
 class ResNetBlock(nn.Module):
     def __init__(self, channels, activation):
         super().__init__()
@@ -48,13 +57,19 @@ class PolicyValueNetwork(nn.Module):
         super().__init__()
         if activation is None:
             activation = nn.ReLU()
-        # input layer
+        # input layer (the parameter names are the same as dlshogi)
         # x1: 駒の配置・利き・利き数、x2: 持ち駒・王手・入玉
-        self.l1_1 = nn.Conv2d(
+        self.l1_1_1 = nn.Conv2d(
             in_channels=FEATURES1_NUM,
             out_channels=channels,
             kernel_size=3,
             padding=1,
+            bias=False,
+        )
+        self.l1_1_2 = nn.Conv2d(
+            in_channels=FEATURES1_NUM,
+            out_channels=channels,
+            kernel_size=1,
             bias=False,
         )
         self.l1_2 = nn.Conv2d(
@@ -72,11 +87,11 @@ class PolicyValueNetwork(nn.Module):
         )
 
         # policy head
-        self.policy_conv = nn.Conv2d(
+        self.policy = nn.Conv2d(
             in_channels=channels, out_channels=MOVE_PLANES_NUM, kernel_size=1, bias=False
         )
         # ラベルごとに独立したバイアス(Conv2d の bias はチャネルごとなので使わない)
-        self.policy_bias = nn.Parameter(torch.zeros(MOVE_LABELS_NUM))
+        self.policy_bias = Bias(MOVE_LABELS_NUM)
 
         # value head
         self.value_conv1 = nn.Conv2d(
@@ -87,14 +102,14 @@ class PolicyValueNetwork(nn.Module):
         self.value_fc2 = nn.Linear(fcl, 1)
 
     def forward(self, x1, x2):
-        x = self.l1_1(x1) + self.l1_2(x2)
+        x = self.l1_1_1(x1) + self.l1_1_2(x1) + self.l1_2(x2)
         x = self.act(self.norm1(x))
 
         # resnet blocks
         x = self.blocks(x)
 
         # policy head
-        policy = self.policy_conv(x).flatten(1) + self.policy_bias
+        policy = self.policy_bias(self.policy(x).flatten(1))
 
         # value head
         value = self.act(self.value_norm1(self.value_conv1(x)))

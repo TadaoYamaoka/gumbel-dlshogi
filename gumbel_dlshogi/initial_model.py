@@ -8,9 +8,11 @@ from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.features import features2_num, set_nyugyoku_features
 from gumbel_dlshogi.network import (
     add_network_argument,
+    load_torchscript_state_dict,
     policy_value_network,
     save_torchscript_model,
 )
+from gumbel_dlshogi.serializers import load_npz
 
 
 def save_state_dict(model, output_path):
@@ -74,12 +76,9 @@ def check_model_state(state_dict_path, *, network, use_nyugyoku_features):
 
 def check_torchscript_model(torchscript_path, *, network, use_nyugyoku_features):
     """Raises ValueError if the TorchScript model does not match the model settings."""
-    state_dict = torch.jit.load(str(torchscript_path), map_location="cpu").state_dict()
-    # The model is saved in PolicyValueNetworkAddSigmoid
-    prefix = "base_model."
     _check_model_file(
         torchscript_path,
-        {key.removeprefix(prefix): value for key, value in state_dict.items()},
+        load_torchscript_state_dict(torchscript_path),
         network=network,
         use_nyugyoku_features=use_nyugyoku_features,
     )
@@ -123,7 +122,19 @@ def _check_model_file(model_path, actual, *, network, use_nyugyoku_features):
         expected = policy_value_network(
             network, input2_channels=features2_num()
         ).state_dict()
+    _check_parameters(
+        model_path,
+        expected,
+        actual,
+        network=network,
+        use_nyugyoku_features=use_nyugyoku_features,
+    )
 
+
+def _check_parameters(
+    model_path, expected, actual, *, network, use_nyugyoku_features
+):
+    """Raises ValueError if the names or shapes of the parameters differ."""
     mismatches = sorted(
         key
         for key in expected.keys() | actual.keys()
@@ -150,6 +161,7 @@ def create_initial_model(
     use_nyugyoku_features,
     save_torchscript=True,
     save_state_dict_file=True,
+    npz=None,
 ):
     """Create an initial model and save it.
 
@@ -157,20 +169,38 @@ def create_initial_model(
     the names of the saved files, so that the checks can check what the parameters
     do not determine.
 
+    Args:
+        npz: Model file (.npz, e.g. of dlshogi) to initialize the model with. It
+            must be the network given by `network` (the activation is not checked).
+
     Returns:
         `(torchscript_path, state_dict_path)`. A path is None if it was not saved.
+
+    Raises:
+        ValueError: If npz does not match the network.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    set_nyugyoku_features(use_nyugyoku_features)
+    print(f"Creating initial model {network}")
+    model = policy_value_network(network, input2_channels=features2_num())
+    if npz:
+        state_dict = load_npz(npz)
+        _check_parameters(
+            npz,
+            model.state_dict(),
+            state_dict,
+            network=network,
+            use_nyugyoku_features=use_nyugyoku_features,
+        )
+        model.load_state_dict(state_dict)
+        print(f"Initialized with the npz model {npz}")
 
     # Remove the old settings before overwriting the files, so that they do not
     # describe a file left from the earlier save or if the save stops on the way
     model_settings_path = settings_path(output_dir / model_name)
     model_settings_path.unlink(missing_ok=True)
-
-    set_nyugyoku_features(use_nyugyoku_features)
-    print(f"Creating initial model {network}")
-    model = policy_value_network(network, input2_channels=features2_num())
 
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
@@ -214,6 +244,12 @@ def main():
         action="store_true",
         help="Use nyugyoku features in the input",
     )
+    parser.add_argument(
+        "--npz",
+        type=str,
+        help="Initialize with a model file (.npz, e.g. of dlshogi) of the network "
+        "given by --network",
+    )
 
     # Output arguments
     parser.add_argument(
@@ -243,14 +279,18 @@ def main():
 
     args = parser.parse_args()
 
-    create_initial_model(
-        args.output_dir,
-        args.model_name,
-        network=args.network,
-        use_nyugyoku_features=args.use_nyugyoku_features,
-        save_torchscript=args.save_torchscript,
-        save_state_dict_file=args.save_state_dict,
-    )
+    try:
+        create_initial_model(
+            args.output_dir,
+            args.model_name,
+            network=args.network,
+            use_nyugyoku_features=args.use_nyugyoku_features,
+            save_torchscript=args.save_torchscript,
+            save_state_dict_file=args.save_state_dict,
+            npz=args.npz,
+        )
+    except ValueError as e:
+        parser.error(str(e))
     print("Model creation and saving completed!")
 
 

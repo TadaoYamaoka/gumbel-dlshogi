@@ -146,7 +146,8 @@ def main():
         "--start_cycle",
         type=int,
         help="The cycle number to start from. If omitted, resume after the last "
-        "completed cycle in the workspace, or start from cycle 1 with --initial_model.",
+        "completed cycle in the workspace, or start from cycle 1 with an initial model "
+        "(--initial_model or --initial_model_npz).",
     )
     parser.add_argument(
         "--initial_model",
@@ -158,6 +159,12 @@ def main():
         "--initial_model_state",
         type=str,
         help="Path to the initial model state (.pth file) used with --initial_model.",
+    )
+    parser.add_argument(
+        "--initial_model_npz",
+        type=str,
+        help="Path to a model file (.npz, e.g. of dlshogi) of the network given by "
+        "--network. The initial model is created from it in the workspace.",
     )
     parser.add_argument(
         "--workspace",
@@ -230,7 +237,9 @@ def main():
     checkpoint_dir.mkdir(exist_ok=True)
 
     # Determine the cycle to start from
-    use_initial_model = args.initial_model or args.initial_model_state
+    use_initial_model = (
+        args.initial_model or args.initial_model_state or args.initial_model_npz
+    )
     if args.start_cycle is None:
         if use_initial_model:
             args.start_cycle = 1
@@ -238,7 +247,13 @@ def main():
             args.start_cycle = max(find_completed_cycles(models_dir), default=0) + 1
     elif args.start_cycle > 1 and use_initial_model:
         parser.error(
-            "--initial_model and --initial_model_state are only used from cycle 1."
+            "--initial_model, --initial_model_state and --initial_model_npz are "
+            "only used from cycle 1."
+        )
+    if args.initial_model_npz and (args.initial_model or args.initial_model_state):
+        parser.error(
+            "--initial_model_npz cannot be used with --initial_model or "
+            "--initial_model_state."
         )
     if args.start_cycle > args.cycles:
         print(f"All {args.cycles} cycles have already been completed.")
@@ -265,16 +280,25 @@ def main():
             initial_model_path = model_path(models_dir, 0)
             initial_model_state_path = initial_model_path.with_suffix(".pth")
             # The settings are saved last with the names of the saved files, so the
-            # initial model is complete if they list both files
-            if all(
+            # initial model is complete if they list both files. It is always created
+            # from the npz file, since the existing one may be from another file.
+            reuse_initial_model = not args.initial_model_npz and all(
                 read_model_settings(path) is not None
                 for path in (initial_model_path, initial_model_state_path)
-            ):
+            )
+            if reuse_initial_model:
                 print(f"Using the existing initial model {initial_model_path}")
             else:
-                create_initial_model(
-                    models_dir, initial_model_path.stem, **model_settings
-                )
+                try:
+                    create_initial_model(
+                        models_dir,
+                        initial_model_path.stem,
+                        **model_settings,
+                        npz=args.initial_model_npz,
+                    )
+                except ValueError as e:
+                    # Raised only when the npz file does not match the network
+                    parser.error(f"{e}. Give the network of the npz model.")
 
         # Check the initial model against the settings before starting self-play
         try:
