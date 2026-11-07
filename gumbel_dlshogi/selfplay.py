@@ -285,8 +285,8 @@ def selfplay(
                     logits, value = model(torch_features.to(device))
 
             for i, actor in enumerate(actors):
-                actor.step.prior_logits = logits[i].cpu().numpy()
-                actor.step.value = value[i].cpu().numpy()[0]
+                actor.step.prior_logits = logits[i].float().cpu().numpy()
+                actor.step.value = value[i].float().cpu().numpy()[0]
 
                 invalid_actions = _get_invalid_actions(actor.board)
                 actor.step.prior_logits = _mask_invalid_actions(
@@ -342,8 +342,8 @@ def selfplay_worker_mp(
                     logits, value = model(torch_features.to(device))
 
         for i, actor in enumerate(actors):
-            actor.step.prior_logits = logits[i].cpu().numpy()
-            actor.step.value = value[i].cpu().numpy()[0]
+            actor.step.prior_logits = logits[i].float().cpu().numpy()
+            actor.step.value = value[i].float().cpu().numpy()[0]
 
             invalid_actions = _get_invalid_actions(actor.board)
             actor.step.prior_logits = _mask_invalid_actions(
