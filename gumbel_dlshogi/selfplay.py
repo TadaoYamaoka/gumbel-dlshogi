@@ -36,11 +36,24 @@ from gumbel_dlshogi.features import (
     make_move_label,
     set_nyugyoku_features,
 )
+from gumbel_dlshogi.initial_model import (
+    check_torchscript_model,
+    read_model_settings,
+)
 from gumbel_dlshogi.mcts import base
 from gumbel_dlshogi.mcts.action_selection import init_table
 from gumbel_dlshogi.mcts.base import EvaluationStep, RootFnOutput
 from gumbel_dlshogi.mcts.policies import _mask_invalid_actions, gumbel_muzero_policy
 from gumbel_dlshogi.mcts.search import MAX_MOVES
+from gumbel_dlshogi.network import (
+    PolicyValueNetworkAddSigmoid,
+    add_compile_arguments,
+    add_network_argument,
+    compile_model,
+    load_torchscript_state_dict,
+    policy_value_network,
+    resolve_compile_options,
+)
 
 
 @dataclass
@@ -283,6 +296,55 @@ def write_training_data(
         stats_dict["max_moves_count"] = max_moves_count
 
 
+def _check_compile(
+    model_path, device, compile_options, network, use_nyugyoku_features
+):
+    """Checks the options to compile the model, and returns the network of the model.
+
+    It is called before starting self-play (and the worker processes), so that an
+    error does not stop only the workers. The network is read from the settings saved
+    with the model if not given, and checked against them (e.g. the activation,
+    which the parameters do not determine).
+
+    Raises:
+        ValueError: If the options or the network are invalid.
+    """
+    resolve_compile_options(device, **compile_options)
+    if network is None:
+        model_settings = read_model_settings(model_path)
+        if model_settings is None:
+            raise ValueError(
+                f"The network of {model_path} is unknown, so give it to compile"
+            )
+        network = model_settings["network"]
+    check_torchscript_model(
+        model_path, network=network, use_nyugyoku_features=use_nyugyoku_features
+    )
+    return network
+
+
+def _load_model(model_path, device, compile_options, network):
+    """Loads the TorchScript model for inference, or compiles it with torch.compile.
+
+    torch.compile does not compile TorchScript, so the network given by its name
+    (checked by _check_compile) is built again with the parameters of the TorchScript
+    model.
+
+    Args:
+        compile_options: None to use the TorchScript model, or the arguments of
+            compile_model(), e.g. {"backend": None, "mode": None}
+    """
+    if compile_options is None:
+        return torch.jit.load(model_path, map_location=device).eval()
+
+    model = policy_value_network(network, input2_channels=features2_num())
+    model.load_state_dict(load_torchscript_state_dict(model_path))
+    model.to(device).eval()
+    return compile_model(
+        PolicyValueNetworkAddSigmoid(model).eval(), device, **compile_options
+    )
+
+
 def selfplay(
     model_path,
     batch_size,
@@ -294,13 +356,17 @@ def selfplay(
     skip_max_moves=False,
     debug=False,
     use_nyugyoku_features=False,
+    compile_options=None,
+    network=None,
 ):
     set_nyugyoku_features(use_nyugyoku_features)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = torch.jit.load(model_path)
-    model.to(device)
-    model.eval()
+    if compile_options is not None:
+        network = _check_compile(
+            model_path, device, compile_options, network, use_nyugyoku_features
+        )
+    model = _load_model(model_path, device, compile_options, network)
 
     init_table(max_num_considered_actions, num_simulations)
 
@@ -344,16 +410,16 @@ def selfplay_worker_mp(
     amp,
     debug,
     use_nyugyoku_features,
+    compile_options,
+    network,
 ):
     """マルチプロセス用の自己対局ワーカー"""
     # 特徴量の設定はプロセス単位なので、ワーカーごとに設定する
     set_nyugyoku_features(use_nyugyoku_features)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = torch.jit.load(model_path)
     with lock:
-        model.to(device)
-    model.eval()
+        model = _load_model(model_path, device, compile_options, network)
 
     init_table(max_num_considered_actions, num_simulations)
 
@@ -386,9 +452,18 @@ def selfplay_multiprocess(
     skip_max_moves=False,
     debug=False,
     use_nyugyoku_features=False,
+    compile_options=None,
+    network=None,
 ):
     """マルチプロセスで自己対局を実行する"""
     import multiprocessing as mp
+
+    # Check the options here, since an error in the workers does not stop the writer
+    if compile_options is not None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        network = _check_compile(
+            model_path, device, compile_options, network, use_nyugyoku_features
+        )
 
     try:
         mp.set_start_method("spawn")
@@ -422,6 +497,8 @@ def selfplay_multiprocess(
                 amp,
                 debug,
                 use_nyugyoku_features,
+                compile_options,
+                network,
             ),
             daemon=True,
         )
@@ -429,8 +506,16 @@ def selfplay_multiprocess(
         processes.append(p)
 
     try:
-        writer_process.join()
         # Writerが終了したら、全局面生成完了
+        while writer_process.is_alive():
+            writer_process.join(timeout=1)
+            # The workers run until stop_event is set, so an exited one has failed
+            failed = [p for p in processes if not p.is_alive()]
+            if failed and writer_process.is_alive():
+                raise RuntimeError(
+                    f"{len(failed)} self-play processes have exited unexpectedly "
+                    f"(exit codes: {[p.exitcode for p in failed]})"
+                )
     except KeyboardInterrupt:
         print("\nTerminating self-play processes.")
     finally:
@@ -480,7 +565,22 @@ if __name__ == "__main__":
         action="store_true",
         help="Use nyugyoku features in the input",
     )
+    parser.add_argument(
+        "--compile", action="store_true", help="Compile the model with torch.compile"
+    )
+    add_network_argument(
+        parser,
+        default=None,
+        help="Network of the model to compile it. Defaults to the network in the "
+        "settings saved with the model.",
+    )
+    add_compile_arguments(parser)
     args = parser.parse_args()
+    compile_options = (
+        {"backend": args.compile_backend, "mode": args.compile_mode}
+        if args.compile
+        else None
+    )
 
     if args.num_processes > 0:
         selfplay_multiprocess(
@@ -495,6 +595,8 @@ if __name__ == "__main__":
             args.skip_max_moves,
             debug=args.debug,
             use_nyugyoku_features=args.use_nyugyoku_features,
+            compile_options=compile_options,
+            network=args.network,
         )
     else:
         selfplay(
@@ -508,4 +610,6 @@ if __name__ == "__main__":
             args.skip_max_moves,
             debug=args.debug,
             use_nyugyoku_features=args.use_nyugyoku_features,
+            compile_options=compile_options,
+            network=args.network,
         )

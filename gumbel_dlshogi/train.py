@@ -13,8 +13,11 @@ from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.data_loader import create_dataloader, create_test_dataloader
 from gumbel_dlshogi.features import features2_num, set_nyugyoku_features
 from gumbel_dlshogi.network import (
+    add_compile_arguments,
     add_network_argument,
+    compile_model,
     policy_value_network,
+    resolve_compile_options,
     save_torchscript_model,
 )
 
@@ -202,8 +205,13 @@ def train(
     eval_interval,
     save_torchscript,
     use_nyugyoku_features=False,
+    compile_options=None,
 ):
     """Main training function
+
+    Args:
+        compile_options: If not None, the model is compiled with torch.compile by
+            compile_model(**compile_options), e.g. {"backend": None, "mode": None}
 
     Returns:
         The path of the checkpoint saved at the last epoch (None if no epoch ran).
@@ -230,6 +238,12 @@ def train(
     # Load initial model if specified
     if initial_model:
         load_initial_model(initial_model, model, device)
+
+    # Train and evaluate with the compiled model. It shares the parameters with model,
+    # which is saved (the state dict of the compiled model has other names).
+    run_model = model
+    if compile_options is not None:
+        run_model = compile_model(model, device, **compile_options)
 
     # Create optimizer
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -276,7 +290,7 @@ def train(
         # Training
         start_time = time.time()
         train_metrics = train_epoch(
-            model, train_dataloader, optimizer, scaler, device, amp
+            run_model, train_dataloader, optimizer, scaler, device, amp
         )
         train_time = time.time() - start_time
 
@@ -306,7 +320,7 @@ def train(
         # Evaluation
         if test_dataloader and (epoch + 1) % eval_interval == 0:
             start_time = time.time()
-            eval_metrics = evaluate(model, test_dataloader, device, amp)
+            eval_metrics = evaluate(run_model, test_dataloader, device, amp)
             eval_time = time.time() - start_time
 
             print(
@@ -402,6 +416,12 @@ def main():
         "--amp", action="store_true", help="Enable automatic mixed precision"
     )
 
+    # torch.compile
+    parser.add_argument(
+        "--compile", action="store_true", help="Compile the model with torch.compile"
+    )
+    add_compile_arguments(parser)
+
     # Checkpoint arguments
     parser.add_argument(
         "--checkpoint_dir",
@@ -429,6 +449,14 @@ def main():
     )
 
     args = parser.parse_args()
+    compile_options = None
+    if args.compile:
+        compile_options = {"backend": args.compile_backend, "mode": args.compile_mode}
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            resolve_compile_options(device, **compile_options)
+        except ValueError as e:
+            parser.error(str(e))
     train(
         train_dir=args.train_dir,
         test_file=args.test_file,
@@ -449,6 +477,7 @@ def main():
         eval_interval=args.eval_interval,
         save_torchscript=args.save_torchscript,
         use_nyugyoku_features=args.use_nyugyoku_features,
+        compile_options=compile_options,
     )
 
 

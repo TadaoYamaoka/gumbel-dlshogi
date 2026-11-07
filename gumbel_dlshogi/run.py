@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 
+import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from gumbel_dlshogi.common import save_atomically
@@ -13,7 +14,11 @@ from gumbel_dlshogi.initial_model import (
     create_initial_model,
     read_model_settings,
 )
-from gumbel_dlshogi.network import add_network_argument
+from gumbel_dlshogi.network import (
+    add_compile_arguments,
+    add_network_argument,
+    resolve_compile_options,
+)
 from gumbel_dlshogi.selfplay import selfplay_multiprocess
 from gumbel_dlshogi.train import train
 
@@ -179,6 +184,11 @@ def main():
     parser.add_argument("--num_simulations", type=int, default=32)
     parser.add_argument("--num_positions", type=int, default=1000000)
     parser.add_argument("--selfplay_amp", action="store_true")
+    parser.add_argument(
+        "--selfplay_compile",
+        action="store_true",
+        help="Compile the model for self-play with torch.compile",
+    )
     parser.add_argument("--num_processes", type=int, default=4)
     parser.add_argument("--skip_max_moves", action="store_true")
 
@@ -192,6 +202,11 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--train_num_workers", type=int, default=0)
     parser.add_argument("--train_amp", action="store_true")
+    parser.add_argument(
+        "--train_compile",
+        action="store_true",
+        help="Compile the model for training with torch.compile",
+    )
     parser.add_argument("--save_interval", type=int, default=1)
     parser.add_argument("--eval_interval", type=int, default=1)
     add_network_argument(parser)
@@ -200,6 +215,9 @@ def main():
         action="store_true",
         help="Use nyugyoku features in the input",
     )
+
+    # torch.compile arguments (for self-play and training)
+    add_compile_arguments(parser)
 
     # Schedule arguments
     parser.add_argument(
@@ -221,6 +239,13 @@ def main():
     args = parser.parse_args()
     if args.train_epochs < 1:
         parser.error("--train_epochs must be at least 1.")
+    compile_options = {"backend": args.compile_backend, "mode": args.compile_mode}
+    if args.selfplay_compile or args.train_compile:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            resolve_compile_options(device, **compile_options)
+        except ValueError as e:
+            parser.error(str(e))
 
     # Parse schedules
     num_simulations_schedule = parse_schedule(args.num_simulations_schedule)
@@ -362,6 +387,8 @@ def main():
             num_processes=args.num_processes,
             skip_max_moves=args.skip_max_moves,
             use_nyugyoku_features=args.use_nyugyoku_features,
+            compile_options=compile_options if args.selfplay_compile else None,
+            network=args.network,
         )
 
         # Log self-play stats to TensorBoard
@@ -419,6 +446,7 @@ def main():
             save_interval=args.save_interval,
             eval_interval=args.eval_interval,
             save_torchscript=str(next_model_path),
+            compile_options=compile_options if args.train_compile else None,
             **model_settings,
         )
         write_cycle_record(models_dir, cycle + 1, resume_checkpoint, model_settings)

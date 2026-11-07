@@ -12,6 +12,7 @@ import argparse
 import inspect
 import re
 from importlib import import_module
+from importlib.util import find_spec
 
 import torch
 import torch.nn as nn
@@ -104,13 +105,14 @@ def _network_type(network):
     return network
 
 
-def add_network_argument(parser):
+def add_network_argument(parser, default="resnet10_relu", help=None):
     """Adds the --network argument, which is checked when it is parsed."""
     parser.add_argument(
         "--network",
         type=_network_type,
-        default="resnet10_relu",
-        help="Network type, e.g. resnet10_relu, resnet20x256_fcl384_swish, senet10",
+        default=default,
+        help=help
+        or "Network type, e.g. resnet10_relu, resnet20x256_fcl384_swish, senet10",
     )
 
 
@@ -140,3 +142,53 @@ def load_torchscript_state_dict(filepath):
     # The network is saved in PolicyValueNetworkAddSigmoid
     prefix = "base_model."
     return {key.removeprefix(prefix): value for key, value in state_dict.items()}
+
+
+def add_compile_arguments(parser):
+    """Adds the arguments of torch.compile (backend and mode)."""
+    parser.add_argument(
+        "--compile_backend",
+        help="Backend of torch.compile. Defaults to inductor, or cudagraphs on CUDA "
+        "if triton is not installed (e.g. on Windows).",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        help="Mode of torch.compile for inductor, e.g. reduce-overhead or max-autotune",
+    )
+
+
+def resolve_compile_options(device, *, backend=None, mode=None):
+    """Returns the arguments of torch.compile.
+
+    inductor needs triton on CUDA, which is often not available on Windows. Then
+    cudagraphs is used by default, which replays the recorded CUDA kernels and reduces
+    the launch overhead. The shapes are static, so a new batch size compiles again.
+
+    Raises:
+        ValueError: If mode is given with a backend other than inductor. torch.compile
+            raises it only when the model is run for the first time.
+    """
+    if backend is None:
+        has_triton = find_spec("triton") is not None
+        use_cudagraphs = device.type == "cuda" and not has_triton
+        backend = "cudagraphs" if use_cudagraphs else "inductor"
+    if mode and backend != "inductor":
+        raise ValueError(
+            f"The compile mode {mode!r} is only for the inductor backend, not "
+            f"{backend!r} (inductor needs triton on CUDA)"
+        )
+    kwargs = {"backend": backend, "dynamic": False}
+    if mode:
+        kwargs["mode"] = mode
+    return kwargs
+
+
+def compile_model(model, device, *, backend=None, mode=None):
+    """Compiles the model with torch.compile (see resolve_compile_options)."""
+    kwargs = resolve_compile_options(device, backend=backend, mode=mode)
+    print(
+        "Using torch.compile("
+        + ", ".join(f"{key}={value}" for key, value in kwargs.items())
+        + ")"
+    )
+    return torch.compile(model, **kwargs)
