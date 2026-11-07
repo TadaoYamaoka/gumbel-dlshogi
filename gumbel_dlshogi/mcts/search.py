@@ -2,13 +2,14 @@ from typing import Any, NamedTuple, Optional, Tuple
 
 import numpy as np
 from cshogi import REPETITION_DRAW, REPETITION_LOSE, REPETITION_WIN, Board
-from pydlshogi2.features import make_move_label
 
+from gumbel_dlshogi.features import make_move_label
 from gumbel_dlshogi.mcts import base
 from gumbel_dlshogi.mcts.action_selection import (
     gumbel_muzero_interior_action_selection,
     gumbel_muzero_root_action_selection,
 )
+from gumbel_dlshogi.mcts.qtransforms import softmax
 from gumbel_dlshogi.mcts.tree import Tree
 
 MAX_MOVES = 512
@@ -62,7 +63,7 @@ def search(
             yield step
         else:
             # Terminal nodes use the game result instead of the network evaluation.
-            # They are never expanded, so no prior logits are needed.
+            # No action is selected from them, so no prior logits are needed.
             step = base.EvaluationStep(value=terminal_value)
         expand(
             tree,
@@ -259,7 +260,7 @@ def update_tree_node(
       tree: `Tree` to whose node is to be updated.
       node_index: the index of the expanded node.
       prior_logits: the prior logits to fill in for the new node, of shape
-        `[num_actions]`. None for terminal nodes, which are never expanded.
+        `[num_actions]`. None for terminal nodes, from which no action is selected.
       value: the value to fill in for the new node.
 
     Returns:
@@ -270,6 +271,8 @@ def update_tree_node(
 
     if prior_logits is not None:
         tree.children_prior_logits[node_index] = prior_logits
+        # Update the prior probabilities together with the logits
+        tree.children_prior_probs[node_index] = softmax(prior_logits)
     tree.raw_values[node_index] = value
     tree.node_values[node_index] = value
     tree.node_visits[node_index] = new_visit
@@ -296,6 +299,9 @@ def instantiate_tree_from_root(
             (num_nodes, num_actions), Tree.UNVISITED, dtype=np.int32
         ),
         children_prior_logits=np.zeros(
+            (num_nodes, num_actions), dtype=root.prior_logits.dtype
+        ),
+        children_prior_probs=np.zeros(
             (num_nodes, num_actions), dtype=root.prior_logits.dtype
         ),
         children_values=np.zeros((num_nodes, num_actions), dtype=np.float32),

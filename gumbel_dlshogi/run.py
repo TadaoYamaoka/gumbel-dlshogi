@@ -85,13 +85,18 @@ def main():
     parser.add_argument("--eval_batch_size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--train_num_workers", type=int, default=4)
+    parser.add_argument("--train_num_workers", type=int, default=0)
     parser.add_argument("--train_amp", action="store_true")
     parser.add_argument("--save_interval", type=int, default=1)
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--blocks", type=int, default=10)
     parser.add_argument("--channels", type=int, default=192)
     parser.add_argument("--fcl", type=int, default=256)
+    parser.add_argument(
+        "--use_nyugyoku_features",
+        action="store_true",
+        help="Use nyugyoku features in the input",
+    )
 
     # Schedule arguments
     parser.add_argument(
@@ -171,6 +176,7 @@ def main():
             amp=args.selfplay_amp,
             num_processes=args.num_processes,
             skip_max_moves=args.skip_max_moves,
+            use_nyugyoku_features=args.use_nyugyoku_features,
         )
 
         # Log self-play stats to TensorBoard
@@ -238,6 +244,7 @@ def main():
             save_interval=args.save_interval,
             eval_interval=args.eval_interval,
             save_torchscript=str(next_model_path),
+            use_nyugyoku_features=args.use_nyugyoku_features,
         )
 
         latest_model_path = str(next_model_path)

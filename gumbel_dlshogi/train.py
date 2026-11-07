@@ -5,12 +5,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from pydlshogi2.network.policy_value_resnet import PolicyValueNetwork
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from gumbel_dlshogi.data_loader import create_dataloader, create_test_dataloader
+from gumbel_dlshogi.features import features2_num, set_nyugyoku_features
+from gumbel_dlshogi.network import PolicyValueNetwork, save_torchscript_model
 
 
 def train_epoch(model, dataloader, optimizer, scaler, device, amp_enabled=True):
@@ -26,15 +27,16 @@ def train_epoch(model, dataloader, optimizer, scaler, device, amp_enabled=True):
     num_batches = 0
 
     with tqdm(dataloader, desc="Training", unit="batch") as pbar:
-        for features, policy_targets, value_targets in pbar:
-            features = features.to(device)
+        for features1, features2, policy_targets, value_targets in pbar:
+            features1 = features1.to(device)
+            features2 = features2.to(device)
             policy_targets = policy_targets.to(device)
             value_targets = value_targets.to(device)
 
             optimizer.zero_grad()
 
-            with autocast(enabled=amp_enabled):
-                policy_output, value_output = model(features)
+            with autocast(device.type, enabled=amp_enabled):
+                policy_output, value_output = model(features1, features2)
 
                 # Policy loss - targets are probability distributions
                 policy_loss = policy_criterion(policy_output, policy_targets)
@@ -85,13 +87,14 @@ def evaluate(model, dataloader, device, amp_enabled=True):
 
     with torch.no_grad():
         with tqdm(dataloader, desc="Evaluating", unit="batch") as pbar:
-            for features, policy_targets, value_targets in pbar:
-                features = features.to(device)
+            for features1, features2, policy_targets, value_targets in pbar:
+                features1 = features1.to(device)
+                features2 = features2.to(device)
                 policy_targets = policy_targets.to(device)
                 value_targets = value_targets.to(device)
 
-                with autocast(enabled=amp_enabled):
-                    policy_output, value_output = model(features)
+                with autocast(device.type, enabled=amp_enabled):
+                    policy_output, value_output = model(features1, features2)
 
                     # For test data, policy_targets are labels (long), not distributions
                     policy_loss = policy_criterion(policy_output, policy_targets)
@@ -116,7 +119,7 @@ def evaluate(model, dataloader, device, amp_enabled=True):
                 total_loss += total_batch_loss.item()
                 policy_loss_sum += policy_loss.item()
                 value_loss_sum += value_loss.item()
-                total_samples += features.size(0)
+                total_samples += features1.size(0)
 
                 # Update progress bar
                 pbar.set_postfix(
@@ -174,24 +177,6 @@ def load_initial_model(filepath, model, device):
     print(f"Initial model loaded from {filepath}")
 
 
-def save_torchscript_model(model, filepath):
-    """Save model as TorchScript"""
-    model.eval()
-
-    class PolicyValueNetworkAddSigmoid(torch.nn.Module):
-        def __init__(self, model):
-            super(PolicyValueNetworkAddSigmoid, self).__init__()
-            self.base_model = model
-
-        def forward(self, x):
-            y1, y2 = self.base_model(x)
-            return y1, torch.sigmoid(y2)
-
-    scripted_model = torch.jit.script(PolicyValueNetworkAddSigmoid(model))
-    scripted_model.save(filepath)
-    print(f"TorchScript model saved to {filepath}")
-
-
 def train(
     train_dir,
     test_file,
@@ -213,8 +198,11 @@ def train(
     save_interval,
     eval_interval,
     save_torchscript,
+    use_nyugyoku_features=False,
 ):
     """Main training function"""
+    set_nyugyoku_features(use_nyugyoku_features)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -230,7 +218,9 @@ def train(
         writer = SummaryWriter(log_dir=log_dir_path)
 
     # Create model
-    model = PolicyValueNetwork(blocks=blocks, channels=channels, fcl=fcl).to(device)
+    model = PolicyValueNetwork(
+        blocks=blocks, channels=channels, fcl=fcl, input2_channels=features2_num()
+    ).to(device)
 
     # Load initial model if specified
     if initial_model:
@@ -240,7 +230,7 @@ def train(
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # Create gradient scaler for mixed precision
-    scaler = GradScaler(enabled=amp)
+    scaler = GradScaler(device.type, enabled=amp)
 
     # Create data loaders
     train_dataloader = create_dataloader(
@@ -249,6 +239,7 @@ def train(
         num_files=num_files,
         num_workers=num_workers,
         shuffle=True,
+        use_nyugyoku_features=use_nyugyoku_features,
     )
 
     test_dataloader = None
@@ -258,6 +249,7 @@ def train(
             batch_size=eval_batch_size,
             num_workers=num_workers,
             shuffle=False,
+            use_nyugyoku_features=use_nyugyoku_features,
         )
 
     # Resume from checkpoint if specified
@@ -270,10 +262,6 @@ def train(
         start_epoch += 1
 
     max_epochs = start_epoch + epochs
-
-    # Create checkpoint directory
-    checkpoint_dir_path = Path(checkpoint_dir)
-    checkpoint_dir_path.mkdir(parents=True, exist_ok=True)
 
     # Training loop
     for epoch in range(start_epoch, max_epochs):
@@ -386,6 +374,11 @@ def main():
         "--fcl", type=int, default=256, help="Fully connected layer size"
     )
     parser.add_argument(
+        "--use_nyugyoku_features",
+        action="store_true",
+        help="Use nyugyoku features in the input",
+    )
+    parser.add_argument(
         "--initial_model", type=str, help="Path to initial model state dict (.pth file)"
     )
     # Training arguments
@@ -399,7 +392,7 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument(
-        "--num_workers", type=int, default=4, help="Number of data loader workers"
+        "--num_workers", type=int, default=0, help="Number of data loader workers"
     )
 
     # Mixed precision
@@ -455,6 +448,7 @@ def main():
         save_interval=args.save_interval,
         eval_interval=args.eval_interval,
         save_torchscript=args.save_torchscript,
+        use_nyugyoku_features=args.use_nyugyoku_features,
     )
 
 

@@ -2,34 +2,9 @@ import argparse
 from pathlib import Path
 
 import torch
-from pydlshogi2.network.policy_value_resnet import PolicyValueNetwork
 
-
-def create_initial_model(blocks=10, channels=192, fcl=256):
-    """Create and return an initial PolicyValueNetwork model"""
-    model = PolicyValueNetwork(blocks=blocks, channels=channels, fcl=fcl)
-    return model
-
-
-def save_torchscript_model(model, output_path):
-    """Save model as TorchScript"""
-    model.eval()
-
-    class PolicyValueNetworkAddSigmoid(torch.nn.Module):
-        def __init__(self, model):
-            super(PolicyValueNetworkAddSigmoid, self).__init__()
-            self.base_model = model
-
-        def forward(self, x):
-            y1, y2 = self.base_model(x)
-            return y1, torch.sigmoid(y2)
-
-    # Script the model
-    scripted_model = torch.jit.script(PolicyValueNetworkAddSigmoid(model))
-
-    # Save the scripted model
-    scripted_model.save(output_path)
-    print(f"TorchScript model saved to {output_path}")
+from gumbel_dlshogi.features import features2_num, set_nyugyoku_features
+from gumbel_dlshogi.network import PolicyValueNetwork, save_torchscript_model
 
 
 def save_state_dict(model, output_path):
@@ -51,6 +26,11 @@ def main():
     parser.add_argument(
         "--fcl", type=int, default=256, help="Fully connected layer size"
     )
+    parser.add_argument(
+        "--use_nyugyoku_features",
+        action="store_true",
+        help="Use nyugyoku features in the input",
+    )
 
     # Output arguments
     parser.add_argument(
@@ -67,13 +47,13 @@ def main():
     )
     parser.add_argument(
         "--save_torchscript",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Save model as TorchScript",
     )
     parser.add_argument(
         "--save_state_dict",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Save model state dict",
     )
@@ -85,11 +65,15 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Create initial model
+    set_nyugyoku_features(args.use_nyugyoku_features)
     print(
         f"Creating initial model with {args.blocks} blocks, {args.channels} channels, {args.fcl} fcl"
     )
-    model = create_initial_model(
-        blocks=args.blocks, channels=args.channels, fcl=args.fcl
+    model = PolicyValueNetwork(
+        blocks=args.blocks,
+        channels=args.channels,
+        fcl=args.fcl,
+        input2_channels=features2_num(),
     )
 
     # Print model info

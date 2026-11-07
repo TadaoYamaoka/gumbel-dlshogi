@@ -20,7 +20,7 @@ def qtransform_completed_by_mix_value(
 
     # Computing the mixed value and producing completed_qvalues.
     raw_value = tree.raw_values[node_index]
-    prior_probs = softmax(tree.children_prior_logits[node_index])
+    prior_probs = tree.children_prior_probs[node_index]
     value = _compute_mixed_value(
         raw_value, qvalues=qvalues, visit_counts=visit_counts, prior_probs=prior_probs
     )
@@ -64,17 +64,13 @@ def _compute_mixed_value(raw_value, qvalues, visit_counts, prior_probs):
     Returns:
       An estimator of the state value. Shape `[]`.
     """
-    sum_visit_counts = np.sum(visit_counts)
+    # Only the visited actions contribute, so compute over them alone.
+    visited = np.flatnonzero(visit_counts)
+    if len(visited) == 0:
+        return raw_value
+    sum_visit_counts = np.sum(visit_counts[visited])
     # Ensuring non-nan weighted_q, even if the visited actions have zero
     # prior probability.
-    prior_probs = np.maximum(np.finfo(prior_probs.dtype).tiny, prior_probs)
-    # Summing the probabilities of the visited actions.
-    sum_probs = np.sum(np.where(visit_counts > 0, prior_probs, 0.0))
-    weighted_q = np.sum(
-        np.where(
-            visit_counts > 0,
-            prior_probs * qvalues / np.where(visit_counts > 0, sum_probs, 1.0),
-            0.0,
-        )
-    )
+    visited_probs = np.maximum(np.finfo(prior_probs.dtype).tiny, prior_probs[visited])
+    weighted_q = np.sum(visited_probs * qvalues[visited]) / np.sum(visited_probs)
     return (raw_value + sum_visit_counts * weighted_q) / (sum_visit_counts + 1)

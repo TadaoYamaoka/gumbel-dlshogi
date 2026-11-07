@@ -19,16 +19,18 @@ from cshogi import (
     HuffmanCodedPos,
     move_to_usi,
 )
-from pydlshogi2.features import (
-    FEATURES_NUM,
-    MOVE_LABELS_NUM,
-    make_input_features,
-    make_move_label,
-)
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from tqdm import tqdm
 
 from gumbel_dlshogi.common import dtypeTrainingData
+from gumbel_dlshogi.features import (
+    FEATURES1_NUM,
+    MOVE_LABELS_NUM,
+    features2_num,
+    make_input_features,
+    make_move_label,
+    set_nyugyoku_features,
+)
 from gumbel_dlshogi.mcts import base
 from gumbel_dlshogi.mcts.action_selection import init_table
 from gumbel_dlshogi.mcts.base import EvaluationStep, RootFnOutput
@@ -147,6 +149,40 @@ class Actor:
                 self.policy_outputs = []
 
 
+def _allocate_input_buffers(batch_size):
+    """推論用の入力バッファ x1, x2 を確保する"""
+    # pin_memory は CUDA がある場合のみ使える
+    pin_memory = torch.cuda.is_available()
+    x1 = torch.empty(
+        (batch_size, FEATURES1_NUM, 9, 9), dtype=torch.float32, pin_memory=pin_memory
+    )
+    x2 = torch.empty(
+        (batch_size, features2_num(), 9, 9), dtype=torch.float32, pin_memory=pin_memory
+    )
+    return x1, x2
+
+
+def _step_actors(actors, x1, x2):
+    """各 Actor を1ステップ進め、評価する局面の入力特徴量をバッファに書き込む"""
+    features1, features2 = x1.numpy(), x2.numpy()
+    for i, actor in enumerate(actors):
+        actor.next()
+        make_input_features(actor.board, features1[i], features2[i])
+
+
+def _set_evaluations(actors, logits, value):
+    """推論結果を各 Actor に設定する"""
+    # GPU から CPU へはバッチ単位でまとめて転送する
+    logits = logits.float().cpu().numpy()
+    values = value.float().cpu().numpy().reshape(-1)
+
+    for i, actor in enumerate(actors):
+        actor.step.prior_logits = _mask_invalid_actions(
+            logits[i], _get_invalid_actions(actor.board)
+        )
+        actor.step.value = values[i]
+
+
 def write_training_data(
     queue: Queue,
     output_dir: str,
@@ -244,7 +280,10 @@ def selfplay(
     amp,
     skip_max_moves=False,
     debug=False,
+    use_nyugyoku_features=False,
 ):
+    set_nyugyoku_features(use_nyugyoku_features)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = torch.jit.load(model_path)
     model.to(device)
@@ -265,33 +304,17 @@ def selfplay(
         for _ in range(batch_size)
     ]
 
-    torch_features = torch.empty(
-        (batch_size, FEATURES_NUM, 9, 9),
-        dtype=torch.float32,
-        pin_memory=True,
-        requires_grad=False,
-    )
-    input_features = torch_features.numpy()
+    x1, x2 = _allocate_input_buffers(batch_size)
 
     try:
         while writer_thread.is_alive():
-            for i, actor in enumerate(actors):
-                actor.next()
-                make_input_features(actor.board, input_features[i])
+            _step_actors(actors, x1, x2)
 
             # Evaluate
-            with autocast(enabled=amp):
-                with torch.no_grad():
-                    logits, value = model(torch_features.to(device))
+            with torch.no_grad(), autocast(device.type, enabled=amp):
+                logits, value = model(x1.to(device), x2.to(device))
 
-            for i, actor in enumerate(actors):
-                actor.step.prior_logits = logits[i].float().cpu().numpy()
-                actor.step.value = value[i].float().cpu().numpy()[0]
-
-                invalid_actions = _get_invalid_actions(actor.board)
-                actor.step.prior_logits = _mask_invalid_actions(
-                    actor.step.prior_logits, invalid_actions
-                )
+            _set_evaluations(actors, logits, value)
     except KeyboardInterrupt:
         queue.put(None)
         writer_thread.join()
@@ -307,8 +330,12 @@ def selfplay_worker_mp(
     queue,
     amp,
     debug,
+    use_nyugyoku_features,
 ):
     """マルチプロセス用の自己対局ワーカー"""
+    # 特徴量の設定はプロセス単位なので、ワーカーごとに設定する
+    set_nyugyoku_features(use_nyugyoku_features)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = torch.jit.load(model_path)
     with lock:
@@ -322,33 +349,16 @@ def selfplay_worker_mp(
         for _ in range(batch_size)
     ]
 
-    torch_features = torch.empty(
-        (batch_size, FEATURES_NUM, 9, 9),
-        dtype=torch.float32,
-        pin_memory=True,
-        requires_grad=False,
-    )
-    input_features = torch_features.numpy()
+    x1, x2 = _allocate_input_buffers(batch_size)
 
     while not stop_event.is_set():
-        for i, actor in enumerate(actors):
-            actor.next()
-            make_input_features(actor.board, input_features[i])
+        _step_actors(actors, x1, x2)
 
         # Evaluate with lock
-        with lock:
-            with autocast(enabled=amp):
-                with torch.no_grad():
-                    logits, value = model(torch_features.to(device))
+        with lock, torch.no_grad(), autocast(device.type, enabled=amp):
+            logits, value = model(x1.to(device), x2.to(device))
 
-        for i, actor in enumerate(actors):
-            actor.step.prior_logits = logits[i].float().cpu().numpy()
-            actor.step.value = value[i].float().cpu().numpy()[0]
-
-            invalid_actions = _get_invalid_actions(actor.board)
-            actor.step.prior_logits = _mask_invalid_actions(
-                actor.step.prior_logits, invalid_actions
-            )
+        _set_evaluations(actors, logits, value)
 
 
 def selfplay_multiprocess(
@@ -362,6 +372,7 @@ def selfplay_multiprocess(
     num_processes,
     skip_max_moves=False,
     debug=False,
+    use_nyugyoku_features=False,
 ):
     """マルチプロセスで自己対局を実行する"""
     import multiprocessing as mp
@@ -397,6 +408,7 @@ def selfplay_multiprocess(
                 queue,
                 amp,
                 debug,
+                use_nyugyoku_features,
             ),
             daemon=True,
         )
@@ -450,6 +462,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable debug mode for additional logging",
     )
+    parser.add_argument(
+        "--use_nyugyoku_features",
+        action="store_true",
+        help="Use nyugyoku features in the input",
+    )
     args = parser.parse_args()
 
     if args.num_processes > 0:
@@ -464,6 +481,7 @@ if __name__ == "__main__":
             args.num_processes,
             args.skip_max_moves,
             debug=args.debug,
+            use_nyugyoku_features=args.use_nyugyoku_features,
         )
     else:
         selfplay(
@@ -476,4 +494,5 @@ if __name__ == "__main__":
             args.amp,
             args.skip_max_moves,
             debug=args.debug,
+            use_nyugyoku_features=args.use_nyugyoku_features,
         )

@@ -1,6 +1,7 @@
 import numpy as np
 from cshogi import HuffmanCodedPos
-from pydlshogi2.features import MOVE_LABELS_NUM
+
+from gumbel_dlshogi.features import MOVE_LABELS_NUM
 
 dtypeTrainingData = np.dtype(
     [

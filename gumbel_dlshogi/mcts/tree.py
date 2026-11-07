@@ -25,6 +25,8 @@ class Tree:
       action.
     children_prior_logits: `[N, num_actions]` the action prior logits of each
       node.
+    children_prior_probs: `[N, num_actions]` softmax of `children_prior_logits`,
+      computed once when the node is expanded.
     children_visits: `[N, num_actions]` the visit counts for children for
       each action.
     children_values: `[N, num_actions]` the value of the next node after the
@@ -41,6 +43,7 @@ class Tree:
     action_from_parent: np.ndarray  # [N]
     children_index: np.ndarray  # [N, num_actions]
     children_prior_logits: np.ndarray  # [N, num_actions]
+    children_prior_probs: np.ndarray  # [N, num_actions]
     children_visits: np.ndarray  # [N, num_actions]
     children_values: np.ndarray  # [N, num_actions]
     root_invalid_actions: np.ndarray  # [num_actions]
