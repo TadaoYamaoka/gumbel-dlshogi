@@ -1,9 +1,12 @@
 import argparse
 import collections
+import json
+import re
 from pathlib import Path
 
 from torch.utils.tensorboard import SummaryWriter
 
+from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.initial_model import check_model_state, create_initial_model
 from gumbel_dlshogi.selfplay import selfplay_multiprocess
 from gumbel_dlshogi.train import train
@@ -37,6 +40,84 @@ def get_scheduled_value(cycle, base_value, schedule):
     return current_value
 
 
+def model_path(models_dir, cycle):
+    """Path of the model saved at the end of the cycle (cycle 0 is the initial model)"""
+    return models_dir / f"model_{cycle:08d}.pt"
+
+
+def record_path(models_dir, cycle):
+    """Path of the record written when the cycle has completed"""
+    return model_path(models_dir, cycle).with_suffix(".json")
+
+
+def write_cycle_record(models_dir, cycle, checkpoint, model_settings):
+    """Records that the cycle has completed, with the checkpoint to resume from.
+
+    It is written after the model of the cycle, so the record marks the completion.
+    """
+    record = {"checkpoint": Path(checkpoint).name, "model_settings": model_settings}
+    save_atomically(
+        record_path(models_dir, cycle),
+        lambda path: path.write_text(json.dumps(record, indent=2), encoding="utf-8"),
+    )
+
+
+def read_cycle_record(models_dir, cycle):
+    """Returns the record of the completed cycle, or None if it has not completed."""
+    path = record_path(models_dir, cycle)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def find_completed_cycles(models_dir):
+    """Returns the cycles with a completion record."""
+    return [
+        int(match[1])
+        for path in models_dir.glob("model_*.json")
+        if (match := re.fullmatch(r"model_(\d+)\.json", path.name))
+    ]
+
+
+def invalidate_cycle_records(models_dir, start_cycle):
+    """Removes the completion records of start_cycle and later cycles.
+
+    Their models and checkpoints are overwritten by running them again, so the old
+    records must not mark them as completed if the run stops on the way.
+    """
+    for cycle in sorted(find_completed_cycles(models_dir)):
+        if cycle >= start_cycle:
+            record_path(models_dir, cycle).unlink()
+            print(f"Removed the completion record of cycle {cycle} to run it again")
+
+
+def find_resume_paths(models_dir, checkpoint_dir, cycle, model_settings):
+    """Returns the model and checkpoint of the completed cycle to resume from.
+
+    Raises:
+        ValueError: If the cycle cannot be resumed from.
+    """
+    resume_model_path = model_path(models_dir, cycle)
+    if not resume_model_path.exists():
+        raise ValueError(f"Model for cycle {cycle} not found at {resume_model_path}")
+    record = read_cycle_record(models_dir, cycle)
+    if record is None:
+        raise ValueError(
+            f"Cycle {cycle} has no completion record {record_path(models_dir, cycle)}"
+        )
+    if record["model_settings"] != model_settings:
+        raise ValueError(
+            f"The model settings differ from those of cycle {cycle}: "
+            f"{record['model_settings']}"
+        )
+    resume_checkpoint = checkpoint_dir / record["checkpoint"]
+    if not resume_checkpoint.exists():
+        raise ValueError(
+            f"The checkpoint {resume_checkpoint} of cycle {cycle} is not found"
+        )
+    return resume_model_path, resume_checkpoint
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Automate self-play and training cycles."
@@ -49,8 +130,8 @@ def main():
     parser.add_argument(
         "--start_cycle",
         type=int,
-        default=1,
-        help="The cycle number to start from.",
+        help="The cycle number to start from. If omitted, resume after the last "
+        "completed cycle in the workspace, or start from cycle 1 with --initial_model.",
     )
     parser.add_argument(
         "--initial_model",
@@ -118,6 +199,8 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.train_epochs < 1:
+        parser.error("--train_epochs must be at least 1.")
 
     # Parse schedules
     num_simulations_schedule = parse_schedule(args.num_simulations_schedule)
@@ -128,8 +211,27 @@ def main():
     models_dir = workspace / "models"
     data_dir = workspace / "data"
     log_dir = workspace / "logs"
+    checkpoint_dir = workspace / "checkpoints"
     models_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(exist_ok=True)
+
+    # Determine the cycle to start from
+    use_initial_model = args.initial_model or args.initial_model_state
+    if args.start_cycle is None:
+        if use_initial_model:
+            args.start_cycle = 1
+        else:
+            args.start_cycle = max(find_completed_cycles(models_dir), default=0) + 1
+    elif args.start_cycle > 1 and use_initial_model:
+        parser.error(
+            "--initial_model and --initial_model_state are only used from cycle 1."
+        )
+    if args.start_cycle > args.cycles:
+        print(f"All {args.cycles} cycles have already been completed.")
+        return
+    if args.start_cycle > 1:
+        print(f"Resuming from cycle {args.start_cycle}")
 
     # Model settings shared by the initial model, its check and training
     model_settings = {
@@ -139,8 +241,9 @@ def main():
         "use_nyugyoku_features": args.use_nyugyoku_features,
     }
 
-    # Determine the starting model path
+    # Determine the starting model path (and the checkpoint when resuming)
     initial_model_state_path = None
+    resume_checkpoint = None
     if args.start_cycle == 1:
         initial_model_path = args.initial_model
         initial_model_state_path = args.initial_model_state
@@ -148,7 +251,7 @@ def main():
             if initial_model_state_path:
                 parser.error("--initial_model_state requires --initial_model.")
             # Create the initial model with the same settings as self-play and training
-            initial_model_path = models_dir / "model_00000000.pt"
+            initial_model_path = model_path(models_dir, 0)
             initial_model_state_path = initial_model_path.with_suffix(".pth")
             if initial_model_path.exists() and initial_model_state_path.exists():
                 print(f"Using the existing initial model {initial_model_path}")
@@ -169,14 +272,22 @@ def main():
         latest_model_path = str(initial_model_path)
     else:
         # Resuming from a later cycle
-        prev_cycle_num = args.start_cycle - 1
-        resume_model_path = models_dir / f"model_{prev_cycle_num:08d}.pt"
-        if not resume_model_path.exists():
-            parser.error(
-                f"Model for cycle {prev_cycle_num} not found at {resume_model_path}. "
-                "Cannot resume."
+        try:
+            resume_model_path, resume_checkpoint = find_resume_paths(
+                models_dir, checkpoint_dir, args.start_cycle - 1, model_settings
             )
+        except ValueError as e:
+            parser.error(f"{e}. Cannot resume.")
         latest_model_path = str(resume_model_path)
+
+    # All checks have passed, so the cycles from start_cycle are run (again)
+    invalidate_cycle_records(models_dir, args.start_cycle)
+    start_model_path = model_path(models_dir, args.start_cycle)
+    if start_model_path.exists():
+        print(
+            f"{start_model_path} already exists and will be replaced by running "
+            f"cycle {args.start_cycle} again."
+        )
 
     for cycle in range(args.start_cycle - 1, args.cycles):
         current_cycle_num = cycle + 1
@@ -237,10 +348,7 @@ def main():
 
         # --- Training Phase ---
         print("--- Training Phase ---")
-        checkpoint_dir = workspace / f"checkpoints"
-        checkpoint_dir.mkdir(exist_ok=True)
-
-        next_model_path = models_dir / f"model_{cycle + 1:08d}.pt"
+        next_model_path = model_path(models_dir, cycle + 1)
 
         # Determine which model/checkpoint to use for training
         initial_model_state = None
@@ -249,14 +357,10 @@ def main():
             # For the very first cycle, use the initial model
             initial_model_state = initial_model_state_path
         else:
-            # For subsequent cycles, resume from the last checkpoint of the previous cycle
-            checkpoints = sorted(
-                checkpoint_dir.glob("*.pth"),
-                key=lambda p: int(p.name.split("_")[-1].split(".")[0]),
-            )
-            resume_path = str(checkpoints[-1])
+            # For subsequent cycles, resume from the checkpoint of the previous cycle
+            resume_path = str(resume_checkpoint)
 
-        train(
+        resume_checkpoint = train(
             train_dir=str(data_dir),
             test_file=args.test_file,
             num_files=num_files,
@@ -276,6 +380,7 @@ def main():
             save_torchscript=str(next_model_path),
             **model_settings,
         )
+        write_cycle_record(models_dir, cycle + 1, resume_checkpoint, model_settings)
 
         latest_model_path = str(next_model_path)
 

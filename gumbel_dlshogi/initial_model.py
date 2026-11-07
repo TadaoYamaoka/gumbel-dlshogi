@@ -3,13 +3,14 @@ from pathlib import Path
 
 import torch
 
+from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.features import features2_num, set_nyugyoku_features
 from gumbel_dlshogi.network import PolicyValueNetwork, save_torchscript_model
 
 
 def save_state_dict(model, output_path):
     """Save model state dict"""
-    torch.save(model.state_dict(), output_path)
+    save_atomically(output_path, lambda path: torch.save(model.state_dict(), path))
     print(f"Model state dict saved to {output_path}")
 
 

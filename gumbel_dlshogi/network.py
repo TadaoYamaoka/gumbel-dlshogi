@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.features import FEATURES1_NUM, MOVE_LABELS_NUM, MOVE_PLANES_NUM
 
 
@@ -104,5 +105,5 @@ def save_torchscript_model(model, filepath):
     """Save model as TorchScript"""
     model.eval()
     scripted_model = torch.jit.script(PolicyValueNetworkAddSigmoid(model))
-    scripted_model.save(filepath)
+    save_atomically(filepath, lambda path: scripted_model.save(str(path)))
     print(f"TorchScript model saved to {filepath}")

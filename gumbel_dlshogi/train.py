@@ -9,6 +9,7 @@ from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.data_loader import create_dataloader, create_test_dataloader
 from gumbel_dlshogi.features import features2_num, set_nyugyoku_features
 from gumbel_dlshogi.network import PolicyValueNetwork, save_torchscript_model
@@ -151,7 +152,7 @@ def save_checkpoint(model, optimizer, scaler, epoch, total_steps, loss, filepath
         "scaler_state_dict": scaler.state_dict(),
         "loss": loss,
     }
-    torch.save(checkpoint, filepath)
+    save_atomically(filepath, lambda path: torch.save(checkpoint, path))
     print(f"Checkpoint saved to {filepath}")
 
 
@@ -200,7 +201,11 @@ def train(
     save_torchscript,
     use_nyugyoku_features=False,
 ):
-    """Main training function"""
+    """Main training function
+
+    Returns:
+        The path of the checkpoint saved at the last epoch (None if no epoch ran).
+    """
     set_nyugyoku_features(use_nyugyoku_features)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -264,6 +269,7 @@ def train(
     max_epochs = start_epoch + epochs
 
     # Training loop
+    checkpoint_path = None
     for epoch in range(start_epoch, max_epochs):
         print(f"Epoch {epoch + 1}/{max_epochs}")
 
@@ -349,6 +355,8 @@ def train(
 
     if writer:
         writer.close()
+
+    return checkpoint_path
 
 
 def main():
