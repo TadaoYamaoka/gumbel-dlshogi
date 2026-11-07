@@ -7,7 +7,13 @@ from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 
 from gumbel_dlshogi.common import save_atomically
-from gumbel_dlshogi.initial_model import check_model_state, create_initial_model
+from gumbel_dlshogi.initial_model import (
+    check_model_state,
+    check_torchscript_model,
+    create_initial_model,
+    read_model_settings,
+)
+from gumbel_dlshogi.network import add_network_argument
 from gumbel_dlshogi.selfplay import selfplay_multiprocess
 from gumbel_dlshogi.train import train
 
@@ -46,7 +52,10 @@ def model_path(models_dir, cycle):
 
 
 def record_path(models_dir, cycle):
-    """Path of the record written when the cycle has completed"""
+    """Path of the record written when the cycle has completed
+
+    The record of cycle 0 is the model settings saved with the initial model.
+    """
     return model_path(models_dir, cycle).with_suffix(".json")
 
 
@@ -54,8 +63,14 @@ def write_cycle_record(models_dir, cycle, checkpoint, model_settings):
     """Records that the cycle has completed, with the checkpoint to resume from.
 
     It is written after the model of the cycle, so the record marks the completion.
+    It has the same "model_settings" and "files" as the settings of the initial model,
+    so that the model can be checked when it is used as an initial model.
     """
-    record = {"checkpoint": Path(checkpoint).name, "model_settings": model_settings}
+    record = {
+        "checkpoint": Path(checkpoint).name,
+        "model_settings": model_settings,
+        "files": [model_path(models_dir, cycle).name],
+    }
     save_atomically(
         record_path(models_dir, cycle),
         lambda path: path.write_text(json.dumps(record, indent=2), encoding="utf-8"),
@@ -172,9 +187,7 @@ def main():
     parser.add_argument("--train_amp", action="store_true")
     parser.add_argument("--save_interval", type=int, default=1)
     parser.add_argument("--eval_interval", type=int, default=1)
-    parser.add_argument("--blocks", type=int, default=10)
-    parser.add_argument("--channels", type=int, default=192)
-    parser.add_argument("--fcl", type=int, default=256)
+    add_network_argument(parser)
     parser.add_argument(
         "--use_nyugyoku_features",
         action="store_true",
@@ -235,9 +248,7 @@ def main():
 
     # Model settings shared by the initial model, its check and training
     model_settings = {
-        "blocks": args.blocks,
-        "channels": args.channels,
-        "fcl": args.fcl,
+        "network": args.network,
         "use_nyugyoku_features": args.use_nyugyoku_features,
     }
 
@@ -253,22 +264,28 @@ def main():
             # Create the initial model with the same settings as self-play and training
             initial_model_path = model_path(models_dir, 0)
             initial_model_state_path = initial_model_path.with_suffix(".pth")
-            if initial_model_path.exists() and initial_model_state_path.exists():
+            # The settings are saved last with the names of the saved files, so the
+            # initial model is complete if they list both files
+            if all(
+                read_model_settings(path) is not None
+                for path in (initial_model_path, initial_model_state_path)
+            ):
                 print(f"Using the existing initial model {initial_model_path}")
             else:
                 create_initial_model(
                     models_dir, initial_model_path.stem, **model_settings
                 )
 
-        # Check the initial weights against the settings before starting self-play
-        if initial_model_state_path:
-            try:
+        # Check the initial model against the settings before starting self-play
+        try:
+            check_torchscript_model(initial_model_path, **model_settings)
+            if initial_model_state_path:
                 check_model_state(initial_model_state_path, **model_settings)
-            except ValueError as e:
-                parser.error(
-                    f"{e}. Use the same settings as the initial model, "
-                    "or remove it or use another workspace to create a new one."
-                )
+        except ValueError as e:
+            parser.error(
+                f"{e}. Use the same settings as the initial model, "
+                "or remove it or use another workspace to create a new one."
+            )
         latest_model_path = str(initial_model_path)
     else:
         # Resuming from a later cycle

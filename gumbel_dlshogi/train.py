@@ -12,7 +12,11 @@ from tqdm import tqdm
 from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.data_loader import create_dataloader, create_test_dataloader
 from gumbel_dlshogi.features import features2_num, set_nyugyoku_features
-from gumbel_dlshogi.network import PolicyValueNetwork, save_torchscript_model
+from gumbel_dlshogi.network import (
+    add_network_argument,
+    policy_value_network,
+    save_torchscript_model,
+)
 
 
 def train_epoch(model, dataloader, optimizer, scaler, device, amp_enabled=True):
@@ -182,9 +186,7 @@ def train(
     train_dir,
     test_file,
     num_files,
-    blocks,
-    channels,
-    fcl,
+    network,
     initial_model,
     epochs,
     batch_size,
@@ -223,9 +225,7 @@ def train(
         writer = SummaryWriter(log_dir=log_dir_path)
 
     # Create model
-    model = PolicyValueNetwork(
-        blocks=blocks, channels=channels, fcl=fcl, input2_channels=features2_num()
-    ).to(device)
+    model = policy_value_network(network, input2_channels=features2_num()).to(device)
 
     # Load initial model if specified
     if initial_model:
@@ -360,7 +360,7 @@ def train(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train PolicyValueNetwork")
+    parser = argparse.ArgumentParser(description="Train a policy value network")
 
     # Data arguments
     parser.add_argument(
@@ -374,13 +374,7 @@ def main():
     )
 
     # Model arguments
-    parser.add_argument(
-        "--blocks", type=int, default=10, help="Number of residual blocks"
-    )
-    parser.add_argument("--channels", type=int, default=192, help="Number of channels")
-    parser.add_argument(
-        "--fcl", type=int, default=256, help="Fully connected layer size"
-    )
+    add_network_argument(parser)
     parser.add_argument(
         "--use_nyugyoku_features",
         action="store_true",
@@ -439,9 +433,7 @@ def main():
         train_dir=args.train_dir,
         test_file=args.test_file,
         num_files=args.num_files,
-        blocks=args.blocks,
-        channels=args.channels,
-        fcl=args.fcl,
+        network=args.network,
         initial_model=args.initial_model,
         epochs=args.epochs,
         batch_size=args.batch_size,

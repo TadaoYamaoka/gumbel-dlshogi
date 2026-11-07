@@ -1,13 +1,11 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.features import FEATURES1_NUM, MOVE_LABELS_NUM, MOVE_PLANES_NUM
 
 
 class ResNetBlock(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, activation):
         super().__init__()
         self.conv1 = nn.Conv2d(
             channels, channels, kernel_size=3, padding=1, bias=False
@@ -17,25 +15,39 @@ class ResNetBlock(nn.Module):
             channels, channels, kernel_size=3, padding=1, bias=False
         )
         self.bn2 = nn.BatchNorm2d(channels)
+        self.act = activation
 
     def forward(self, x):
         out = self.conv1(x)
         out = self.bn1(out)
-        out = F.relu(out)
+        out = self.act(out)
 
         out = self.conv2(out)
         out = self.bn2(out)
 
-        return F.relu(out + x)
+        return self.act(out + x)
 
 
 class PolicyValueNetwork(nn.Module):
-    def __init__(self, blocks=10, channels=192, fcl=256, *, input2_channels):
+    def __init__(
+        self,
+        blocks=10,
+        channels=192,
+        activation=None,
+        fcl=256,
+        *,
+        input2_channels,
+        block=ResNetBlock,
+    ):
         """
         Args:
+            activation: Activation module shared by the layers (nn.ReLU() if None)
             input2_channels: Number of planes of the input x2 (features2_num())
+            block: Called as block(channels, activation) to create each block
         """
         super().__init__()
+        if activation is None:
+            activation = nn.ReLU()
         # input layer
         # x1: 駒の配置・利き・利き数、x2: 持ち駒・王手・入玉
         self.l1_1 = nn.Conv2d(
@@ -52,9 +64,12 @@ class PolicyValueNetwork(nn.Module):
             bias=False,
         )
         self.norm1 = nn.BatchNorm2d(channels)
+        self.act = activation
 
         # resnet blocks
-        self.blocks = nn.Sequential(*[ResNetBlock(channels) for _ in range(blocks)])
+        self.blocks = nn.Sequential(
+            *[block(channels, activation) for _ in range(blocks)]
+        )
 
         # policy head
         self.policy_conv = nn.Conv2d(
@@ -73,7 +88,7 @@ class PolicyValueNetwork(nn.Module):
 
     def forward(self, x1, x2):
         x = self.l1_1(x1) + self.l1_2(x2)
-        x = F.relu(self.norm1(x))
+        x = self.act(self.norm1(x))
 
         # resnet blocks
         x = self.blocks(x)
@@ -82,28 +97,8 @@ class PolicyValueNetwork(nn.Module):
         policy = self.policy_conv(x).flatten(1) + self.policy_bias
 
         # value head
-        value = F.relu(self.value_norm1(self.value_conv1(x)))
-        value = F.relu(self.value_fc1(value.flatten(1)))
+        value = self.act(self.value_norm1(self.value_conv1(x)))
+        value = self.act(self.value_fc1(value.flatten(1)))
         value = self.value_fc2(value)
 
         return policy, value
-
-
-class PolicyValueNetworkAddSigmoid(nn.Module):
-    """推論用に value を sigmoid で勝率に変換するラッパー(学習時は logits のまま使う)"""
-
-    def __init__(self, model):
-        super().__init__()
-        self.base_model = model
-
-    def forward(self, x1, x2):
-        y1, y2 = self.base_model(x1, x2)
-        return y1, torch.sigmoid(y2)
-
-
-def save_torchscript_model(model, filepath):
-    """Save model as TorchScript"""
-    model.eval()
-    scripted_model = torch.jit.script(PolicyValueNetworkAddSigmoid(model))
-    save_atomically(filepath, lambda path: scripted_model.save(str(path)))
-    print(f"TorchScript model saved to {filepath}")

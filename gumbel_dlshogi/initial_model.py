@@ -1,11 +1,16 @@
 import argparse
+import json
 from pathlib import Path
 
 import torch
 
 from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.features import features2_num, set_nyugyoku_features
-from gumbel_dlshogi.network import PolicyValueNetwork, save_torchscript_model
+from gumbel_dlshogi.network import (
+    add_network_argument,
+    policy_value_network,
+    save_torchscript_model,
+)
 
 
 def save_state_dict(model, output_path):
@@ -14,21 +19,110 @@ def save_state_dict(model, output_path):
     print(f"Model state dict saved to {output_path}")
 
 
-def check_model_state(
-    state_dict_path, *, blocks, channels, fcl, use_nyugyoku_features
-):
-    """Raises ValueError if the saved state dict does not match the model settings.
+def settings_path(model_path):
+    """Path of the model settings saved with the initial model files"""
+    return Path(model_path).with_suffix(".json")
 
-    The shapes of the parameters determine the number of blocks, channels, fcl and
-    input planes, so compare them with a model built from the settings. The model is
-    built on the meta device, which only has shapes (no memory or random numbers).
+
+def save_model_settings(path, model_settings, files):
+    """Saves the model settings with the names of the files saved with them.
+
+    It is written after the files, so the listed files are complete.
     """
+    record = {"model_settings": model_settings, "files": sorted(files)}
+    text = json.dumps(record, indent=2)
+    save_atomically(path, lambda tmp: tmp.write_text(text, encoding="utf-8"))
+
+
+def _read_settings_record(model_path):
+    """Returns the saved settings record for the model file, or None if not found.
+
+    The record has "model_settings" and "files". It is written by
+    save_model_settings() or as the completion record of a cycle in run.py. A JSON
+    file without them (e.g. written by an older version) is not a record.
+    """
+    path = settings_path(model_path)
+    if not path.exists():
+        return None
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(record, dict) or not {"model_settings", "files"} <= record.keys():
+        return None
+    return record
+
+
+def read_model_settings(model_path):
+    """Returns the settings that the model file was saved with.
+
+    Returns None if they are unknown: the settings are not found, or they were saved
+    with other files (e.g. the file was left from an earlier save).
+    """
+    record = _read_settings_record(model_path)
+    if record is None or Path(model_path).name not in record["files"]:
+        return None
+    return record["model_settings"]
+
+
+def check_model_state(state_dict_path, *, network, use_nyugyoku_features):
+    """Raises ValueError if the saved state dict does not match the model settings."""
+    _check_model_file(
+        state_dict_path,
+        torch.load(state_dict_path, map_location="cpu"),
+        network=network,
+        use_nyugyoku_features=use_nyugyoku_features,
+    )
+
+
+def check_torchscript_model(torchscript_path, *, network, use_nyugyoku_features):
+    """Raises ValueError if the TorchScript model does not match the model settings."""
+    state_dict = torch.jit.load(str(torchscript_path), map_location="cpu").state_dict()
+    # The model is saved in PolicyValueNetworkAddSigmoid
+    prefix = "base_model."
+    _check_model_file(
+        torchscript_path,
+        {key.removeprefix(prefix): value for key, value in state_dict.items()},
+        network=network,
+        use_nyugyoku_features=use_nyugyoku_features,
+    )
+
+
+def _check_model_file(model_path, actual, *, network, use_nyugyoku_features):
+    """Raises ValueError if the model file does not match the model settings.
+
+    The settings saved with the file must be the same. The parameters do not
+    determine some settings (e.g. relu and swish have the same parameters). If the
+    settings were saved with other files only, the file was left from an earlier save
+    and its settings are unknown, so it is an error.
+
+    The names and shapes of the parameters determine the rest of the network and the
+    input planes, so compare them with a model built from the settings. This also
+    checks a file saved without the settings (e.g. not by create_initial_model). The
+    model is built on the meta device, which only has shapes (no memory or random
+    numbers).
+    """
+    model_settings = {
+        "network": network,
+        "use_nyugyoku_features": use_nyugyoku_features,
+    }
+    record = _read_settings_record(model_path)
+    if record is None:
+        print(
+            f"Warning: The settings of {model_path} are not found in "
+            f"{settings_path(model_path)}, so only its parameters are checked "
+            "(not e.g. the activation)."
+        )
+    elif Path(model_path).name not in record["files"]:
+        raise ValueError(
+            f"{model_path} is not one of the files saved with the settings "
+            f"{settings_path(model_path)}, so it may be left from an earlier save"
+        )
+    elif record["model_settings"] != model_settings:
+        raise ValueError(f"{model_path} was created with {record['model_settings']}")
+
     set_nyugyoku_features(use_nyugyoku_features)
     with torch.device("meta"):
-        expected = PolicyValueNetwork(
-            blocks=blocks, channels=channels, fcl=fcl, input2_channels=features2_num()
+        expected = policy_value_network(
+            network, input2_channels=features2_num()
         ).state_dict()
-    actual = torch.load(state_dict_path, map_location="cpu")
 
     mismatches = sorted(
         key
@@ -42,8 +136,8 @@ def check_model_state(
         if len(mismatches) > 5:
             details += ", ..."
         raise ValueError(
-            f"{state_dict_path} does not match blocks={blocks}, channels={channels}, "
-            f"fcl={fcl}, use_nyugyoku_features={use_nyugyoku_features} "
+            f"{model_path} does not match network={network}, "
+            f"use_nyugyoku_features={use_nyugyoku_features} "
             f"(mismatched parameters: {details})"
         )
 
@@ -52,14 +146,16 @@ def create_initial_model(
     output_dir,
     model_name,
     *,
-    blocks,
-    channels,
-    fcl,
+    network,
     use_nyugyoku_features,
     save_torchscript=True,
     save_state_dict_file=True,
 ):
     """Create an initial model and save it.
+
+    The model settings are saved to <model_name>.json after the model files, with
+    the names of the saved files, so that the checks can check what the parameters
+    do not determine.
 
     Returns:
         `(torchscript_path, state_dict_path)`. A path is None if it was not saved.
@@ -67,13 +163,14 @@ def create_initial_model(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Remove the old settings before overwriting the files, so that they do not
+    # describe a file left from the earlier save or if the save stops on the way
+    model_settings_path = settings_path(output_dir / model_name)
+    model_settings_path.unlink(missing_ok=True)
+
     set_nyugyoku_features(use_nyugyoku_features)
-    print(
-        f"Creating initial model with {blocks} blocks, {channels} channels, {fcl} fcl"
-    )
-    model = PolicyValueNetwork(
-        blocks=blocks, channels=channels, fcl=fcl, input2_channels=features2_num()
-    )
+    print(f"Creating initial model {network}")
+    model = policy_value_network(network, input2_channels=features2_num())
 
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
@@ -93,22 +190,25 @@ def create_initial_model(
         state_dict_path = output_dir / f"{model_name}.pth"
         save_state_dict(model, state_dict_path)
 
+    # Save the model settings for the files saved above
+    saved_files = [path.name for path in (torchscript_path, state_dict_path) if path]
+    if saved_files:
+        save_model_settings(
+            model_settings_path,
+            {"network": network, "use_nyugyoku_features": use_nyugyoku_features},
+            saved_files,
+        )
+
     return torchscript_path, state_dict_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Create and save initial PolicyValueNetwork model"
+        description="Create and save an initial policy value network"
     )
 
     # Model arguments
-    parser.add_argument(
-        "--blocks", type=int, default=10, help="Number of residual blocks"
-    )
-    parser.add_argument("--channels", type=int, default=192, help="Number of channels")
-    parser.add_argument(
-        "--fcl", type=int, default=256, help="Fully connected layer size"
-    )
+    add_network_argument(parser)
     parser.add_argument(
         "--use_nyugyoku_features",
         action="store_true",
@@ -146,9 +246,7 @@ def main():
     create_initial_model(
         args.output_dir,
         args.model_name,
-        blocks=args.blocks,
-        channels=args.channels,
-        fcl=args.fcl,
+        network=args.network,
         use_nyugyoku_features=args.use_nyugyoku_features,
         save_torchscript=args.save_torchscript,
         save_state_dict_file=args.save_state_dict,
