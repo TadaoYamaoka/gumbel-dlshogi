@@ -22,7 +22,12 @@ from cshogi import (
 from torch.amp import autocast
 from tqdm import tqdm
 
-from gumbel_dlshogi.common import dtypeTrainingData
+from gumbel_dlshogi.common import (
+    POLICY_FILE_EXT,
+    POSITION_FILE_EXT,
+    dtypeMovePolicy,
+    dtypePosition,
+)
 from gumbel_dlshogi.features import (
     FEATURES1_NUM,
     MOVE_LABELS_NUM,
@@ -193,8 +198,8 @@ def write_training_data(
     os.makedirs(output_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    filename = f"{timestamp}.data"
-    filepath = os.path.join(output_dir, filename)
+    position_path = os.path.join(output_dir, timestamp + POSITION_FILE_EXT)
+    policy_path = os.path.join(output_dir, timestamp + POLICY_FILE_EXT)
 
     nyugyoku_count = 0
     draw_count = 0
@@ -233,16 +238,24 @@ def write_training_data(
                     if skip_max_moves:
                         continue
 
-            data = np.empty(len(training_data.policy_outputs), dtype=dtypeTrainingData)
-            for i, (hcp, policy_output) in enumerate(
-                zip(training_data.hcps, training_data.policy_outputs)
-            ):
-                data[i]["hcp"] = hcp
-                data[i]["policy"] = policy_output.action_weights
-                data[i]["result"] = result
+            positions = np.empty(len(training_data.policy_outputs), dtype=dtypePosition)
+            positions["hcp"] = training_data.hcps
+            positions["result"] = result
+            move_policies = []
+            for i, policy_output in enumerate(training_data.policy_outputs):
+                # 確率が0でない手だけを保存する(0の手は読み込み時に0で復元される)
+                labels = np.flatnonzero(policy_output.action_weights)
+                move_policy = np.empty(len(labels), dtype=dtypeMovePolicy)
+                move_policy["label"] = labels
+                move_policy["prob"] = policy_output.action_weights[labels]
+                move_policies.append(move_policy)
+                positions["num_moves"][i] = len(labels)
 
-            with open(filepath, "ab") as f:
-                data.tofile(f)
+            # 局面ファイルは方策ファイルを書いた後に追記する
+            with open(policy_path, "ab") as f:
+                np.concatenate(move_policies).tofile(f)
+            with open(position_path, "ab") as f:
+                positions.tofile(f)
 
             total_moves += len(training_data.policy_outputs)
             total_games += 1

@@ -6,9 +6,15 @@ import torch
 from cshogi import BLACK, BLACK_WIN, WHITE, WHITE_WIN, Board, HuffmanCodedPosAndEval
 from torch.utils.data import DataLoader, Dataset
 
-from gumbel_dlshogi.common import dtypeTrainingData
+from gumbel_dlshogi.common import (
+    POLICY_FILE_EXT,
+    POSITION_FILE_EXT,
+    dtypeMovePolicy,
+    dtypePosition,
+)
 from gumbel_dlshogi.features import (
     FEATURES1_NUM,
+    MOVE_LABELS_NUM,
     features2_num,
     make_input_features,
     make_move_label,
@@ -62,7 +68,8 @@ class TrainingDataset(Dataset):
     def __init__(self, data_dir, num_files=None, use_nyugyoku_features=False):
         """
         Args:
-            data_dir: Directory containing .data files
+            data_dir: Directory containing the position (.pos) and policy (.policy)
+                files written by self-play
             num_files: Number of newest files to use (None for all)
             use_nyugyoku_features: Whether to use nyugyoku features
         """
@@ -70,9 +77,9 @@ class TrainingDataset(Dataset):
         # The feature setting is per process, so apply it where the dataset is created.
         set_nyugyoku_features(use_nyugyoku_features)
 
-        # Find and sort data files by modification time (newest first)
-        pattern = os.path.join(data_dir, "*.data")
-        files = glob.glob(pattern)
+        # Find and sort position files by modification time (newest first)
+        pattern = os.path.join(data_dir, "*" + POSITION_FILE_EXT)
+        files = [file for file in glob.glob(pattern) if os.path.getsize(file) > 0]
         files.sort(key=os.path.getmtime, reverse=True)
 
         # Select specified number of files
@@ -81,16 +88,32 @@ class TrainingDataset(Dataset):
 
         self.files = files
 
+        # Offset of each position's moves in the policy file (the last element is
+        # the total), computed from the numbers of moves
+        self.move_offsets = []
+        for file in files:
+            # np.fromfile silently drops a truncated last record, so check the size
+            if os.path.getsize(file) % dtypePosition.itemsize:
+                raise ValueError(f"Invalid position file size: {file}")
+            num_moves = np.fromfile(file, dtype=dtypePosition)["num_moves"]
+            move_offsets = np.concatenate([[0], np.cumsum(num_moves, dtype=np.int64)])
+            policy_size = os.path.getsize(self._policy_file(file))
+            if move_offsets[-1] * dtypeMovePolicy.itemsize != policy_size:
+                raise ValueError(f"The policy file does not match {file}")
+            self.move_offsets.append(move_offsets)
+
         # Global index where each file starts (the last element is the total)
-        num_samples = [
-            os.path.getsize(file) // dtypeTrainingData.itemsize for file in files
-        ]
+        num_samples = [len(move_offsets) - 1 for move_offsets in self.move_offsets]
         self.file_starts = np.concatenate([[0], np.cumsum(num_samples, dtype=np.int64)])
         self.total_samples = int(self.file_starts[-1])
 
         # Memory maps and the board are created lazily in each process
         self._mmaps = {}
         self._board = None
+
+    @staticmethod
+    def _policy_file(position_file):
+        return os.path.splitext(position_file)[0] + POLICY_FILE_EXT
 
     def __getstate__(self):
         # Do not pickle the memory maps (they would be copied as arrays)
@@ -99,54 +122,67 @@ class TrainingDataset(Dataset):
         state["_board"] = None
         return state
 
-    def _get_mmap(self, file_index):
-        """Get or create memory map for a file"""
+    def _get_mmaps(self, file_index):
+        """Get or create memory maps for the position and policy files"""
         if file_index not in self._mmaps:
-            self._mmaps[file_index] = np.memmap(
-                self.files[file_index], dtype=dtypeTrainingData, mode="r"
+            file = self.files[file_index]
+            self._mmaps[file_index] = (
+                np.memmap(file, dtype=dtypePosition, mode="r"),
+                np.memmap(self._policy_file(file), dtype=dtypeMovePolicy, mode="r"),
             )
         return self._mmaps[file_index]
 
     def _read_samples(self, indices):
-        """Reads the samples at the global indices, keeping their order"""
+        """Reads the positions and policies at the indices, keeping their order"""
         if np.any((indices < 0) | (indices >= self.total_samples)):
             raise IndexError(f"Index out of range: {indices}")
         file_indices = np.searchsorted(self.file_starts, indices, side="right") - 1
-        if len(indices) > 0 and np.all(file_indices == file_indices[0]):
-            # All samples are in one file: advanced indexing already returns a copy
-            file_index = file_indices[0]
-            return self._get_mmap(file_index)[indices - self.file_starts[file_index]]
 
-        samples = np.empty(len(indices), dtype=dtypeTrainingData)
+        positions = np.empty(len(indices), dtype=dtypePosition)
+        # Only moves with non-zero probability are stored; the others stay zero
+        policies = np.zeros((len(indices), MOVE_LABELS_NUM), dtype=np.float32)
         for file_index in np.unique(file_indices):
-            mask = file_indices == file_index
-            local_indices = indices[mask] - self.file_starts[file_index]
-            samples[mask] = self._get_mmap(file_index)[local_indices]
-        return samples
+            rows = np.flatnonzero(file_indices == file_index)
+            local_indices = indices[rows] - self.file_starts[file_index]
+            position_mmap, policy_mmap = self._get_mmaps(file_index)
+            positions[rows] = position_mmap[local_indices]
+
+            # Gather the stored moves of each position and scatter them to its row
+            move_offsets = self.move_offsets[file_index]
+            # starts: positions in the policy file, batch_starts: positions in moves
+            starts = move_offsets[local_indices]
+            counts = move_offsets[local_indices + 1] - starts
+            batch_starts = np.cumsum(counts) - counts
+            move_indices = np.arange(counts.sum()) + np.repeat(
+                starts - batch_starts, counts
+            )
+            moves = policy_mmap[move_indices]
+            policies[np.repeat(rows, counts), moves["label"]] = moves["prob"]
+        return positions, policies
 
     def __len__(self):
         return self.total_samples
 
     def __getitems__(self, indices):
         """Builds a whole batch at once (used by DataLoader)"""
-        samples = self._read_samples(np.asarray(indices, dtype=np.int64))
+        positions, policies = self._read_samples(np.asarray(indices, dtype=np.int64))
 
         if self._board is None:
             self._board = Board()
-        features1, features2, turns = _make_features(self._board, samples["hcp"])
-        policies = torch.from_numpy(np.ascontiguousarray(samples["policy"]))
-        results = _make_results(samples["result"], turns)
+        features1, features2, turns = _make_features(self._board, positions["hcp"])
+        results = _make_results(positions["result"], turns)
 
-        return features1, features2, policies, results
+        return features1, features2, torch.from_numpy(policies), results
 
     def __getitem__(self, idx):
         return tuple(t[0] for t in self.__getitems__([idx]))
 
     def __del__(self):
-        # Clean up memory maps
-        for mmap in self._mmaps.values():
-            if hasattr(mmap, "_mmap"):
-                mmap._mmap.close()
+        # Clean up memory maps (they do not exist if __init__ raised)
+        for mmaps in getattr(self, "_mmaps", {}).values():
+            for mmap in mmaps:
+                if hasattr(mmap, "_mmap"):
+                    mmap._mmap.close()
 
 
 def create_dataloader(
@@ -164,7 +200,7 @@ def create_dataloader(
     Create a DataLoader for training data
 
     Args:
-        data_dir: Directory containing .data files
+        data_dir: Directory containing the self-play position and policy files
         batch_size: Batch size
         num_files: Number of newest files to use (None for all)
         num_workers: Number of worker processes
