@@ -48,15 +48,22 @@ def search(
         invalid_actions = np.zeros_like(root.prior_logits)
 
     for sim in range(num_simulations):
-        parent_index, action = simulate(board, tree, max_num_considered_actions)
+        parent_index, action, terminal_value = simulate(
+            board, tree, max_num_considered_actions
+        )
         # A node first expanded on simulation `i`, will have node index `i`.
         # Node 0 corresponds to the root node.
         next_node_index = tree.children_index[parent_index, action]
         next_node_index = np.where(
             next_node_index == Tree.UNVISITED, sim + 1, next_node_index
         )
-        step = base.EvaluationStep()
-        yield step
+        if terminal_value is None:
+            step = base.EvaluationStep()
+            yield step
+        else:
+            # Terminal nodes use the game result instead of the network evaluation.
+            # They are never expanded, so no prior logits are needed.
+            step = base.EvaluationStep(value=terminal_value)
         expand(
             tree,
             step,
@@ -75,11 +82,30 @@ class _SimulationState(NamedTuple):
     next_node_index: int
     depth: int
     is_continuing: bool
+    terminal_value: Optional[np.float32]
+
+
+def get_terminal_value(board: Board) -> Optional[np.float32]:
+    """Returns the game result from the side to move, or None if not terminal."""
+    if board.is_game_over():
+        return np.float32(0.0)
+    if board.is_nyugyoku():
+        return np.float32(1.0)
+    draw = board.is_draw()
+    if draw == REPETITION_DRAW:
+        return np.float32(0.5)
+    if draw == REPETITION_WIN:
+        return np.float32(1.0)
+    if draw == REPETITION_LOSE:
+        return np.float32(0.0)
+    if board.move_number >= MAX_MOVES:
+        return np.float32(0.5)
+    return None
 
 
 def simulate(
     board: Board, tree: Tree, max_num_considered_actions: int
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.float32]]:
     """Traverses the tree until reaching an unvisited action or `max_depth`.
 
     Each simulation starts from the root and keeps selecting actions traversing
@@ -92,9 +118,10 @@ def simulate(
       max_depth: maximum search tree depth allowed during simulation.
 
     Returns:
-      `(parent_index, action)` tuple, where `parent_index` is the index of the
-      node reached at the end of the simulation, and the `action` is the action to
-      evaluate from the `parent_index`.
+      `(parent_index, action, terminal_value)` tuple, where `parent_index` is the
+      index of the node reached at the end of the simulation, the `action` is the
+      action to evaluate from the `parent_index`, and `terminal_value` is the game
+      result from the side to move if the reached position is terminal, else None.
     """
 
     def body_fun(state):
@@ -122,12 +149,8 @@ def simulate(
         )
         assert move is not None
         board.push(move)
-        if (
-            board.is_game_over()
-            or board.is_nyugyoku()
-            or board.is_draw() in (REPETITION_DRAW, REPETITION_WIN, REPETITION_LOSE)
-            or board.move_number >= MAX_MOVES
-        ):
+        terminal_value = get_terminal_value(board)
+        if terminal_value is not None:
             is_continuing = False
 
         return _SimulationState(
@@ -136,6 +159,7 @@ def simulate(
             next_node_index=next_node_index,
             depth=depth,
             is_continuing=is_continuing,
+            terminal_value=terminal_value,
         )
 
     node_index = np.array(Tree.ROOT_INDEX, dtype=np.int32)
@@ -146,13 +170,14 @@ def simulate(
         next_node_index=node_index,
         depth=depth,
         is_continuing=True,
+        terminal_value=None,
     )
     while state.is_continuing:
         state = body_fun(state)
 
     # Returning a node with a selected action.
     # The action can be already visited.
-    return state.node_index, state.action
+    return state.node_index, state.action, state.terminal_value
 
 
 def expand(
@@ -223,7 +248,7 @@ def backward(board: Board, tree: Tree, leaf_index: np.int32):
 def update_tree_node(
     tree: Tree,
     node_index: np.int32,
-    prior_logits: np.ndarray,
+    prior_logits: Optional[np.ndarray],
     value: np.float32,
 ):
     """Updates the tree at node index.
@@ -232,7 +257,7 @@ def update_tree_node(
       tree: `Tree` to whose node is to be updated.
       node_index: the index of the expanded node.
       prior_logits: the prior logits to fill in for the new node, of shape
-        `[num_actions]`.
+        `[num_actions]`. None for terminal nodes, which are never expanded.
       value: the value to fill in for the new node.
 
     Returns:
@@ -241,7 +266,8 @@ def update_tree_node(
 
     new_visit = tree.node_visits[node_index] + 1
 
-    tree.children_prior_logits[node_index] = prior_logits
+    if prior_logits is not None:
+        tree.children_prior_logits[node_index] = prior_logits
     tree.raw_values[node_index] = value
     tree.node_values[node_index] = value
     tree.node_visits[node_index] = new_visit
