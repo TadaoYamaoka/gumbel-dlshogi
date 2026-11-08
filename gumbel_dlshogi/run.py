@@ -12,10 +12,12 @@ from gumbel_dlshogi.initial_model import (
     check_model_state,
     check_torchscript_model,
     create_initial_model,
+    normalize_model_settings,
     read_model_settings,
 )
 from gumbel_dlshogi.network import (
     add_compile_arguments,
+    add_moves_left_argument,
     add_network_argument,
     resolve_compile_options,
 )
@@ -28,7 +30,11 @@ from gumbel_dlshogi.start_positions import (
     add_start_positions_arguments,
     check_roots_file,
 )
-from gumbel_dlshogi.train import add_gpus_argument, train
+from gumbel_dlshogi.train import (
+    add_gpus_argument,
+    add_moves_left_loss_weight_argument,
+    train,
+)
 
 
 def parse_schedule(schedule_str):
@@ -133,7 +139,7 @@ def find_resume_paths(models_dir, checkpoint_dir, cycle, model_settings):
         raise ValueError(
             f"Cycle {cycle} has no completion record {record_path(models_dir, cycle)}"
         )
-    if record["model_settings"] != model_settings:
+    if normalize_model_settings(record["model_settings"]) != model_settings:
         raise ValueError(
             f"The model settings differ from those of cycle {cycle}: "
             f"{record['model_settings']}"
@@ -221,6 +227,8 @@ def main():
     parser.add_argument("--save_interval", type=int, default=1)
     parser.add_argument("--eval_interval", type=int, default=1)
     add_network_argument(parser)
+    add_moves_left_argument(parser)
+    add_moves_left_loss_weight_argument(parser)
     parser.add_argument(
         "--use_nyugyoku_features",
         action="store_true",
@@ -317,6 +325,7 @@ def main():
     model_settings = {
         "network": args.network,
         "use_nyugyoku_features": args.use_nyugyoku_features,
+        "moves_left": args.moves_left,
     }
 
     # Determine the starting model path (and the checkpoint when resuming)
@@ -491,6 +500,7 @@ def main():
             save_torchscript=str(next_model_path),
             compile_options=compile_options if args.train_compile else None,
             gpus=args.train_gpus,
+            moves_left_loss_weight=args.moves_left_loss_weight,
             **model_settings,
         )
         write_cycle_record(models_dir, cycle + 1, resume_checkpoint, model_settings)

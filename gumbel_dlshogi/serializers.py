@@ -16,6 +16,7 @@ import torch
 
 from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.network import load_torchscript_state_dict
+from gumbel_dlshogi.network.moves_left import MOVES_LEFT_PREFIX
 
 # Parameter names of the npz files saved by Chainer (older versions of dlshogi)
 _CHAINER_NAMES = {
@@ -65,9 +66,22 @@ def main():
     )
     parser.add_argument("model", help="TorchScript model (.pt) saved by this package")
     parser.add_argument("npz", help="Output npz file")
+    parser.add_argument(
+        "--include_moves_left",
+        action="store_true",
+        help="Include the moves-left head, which dlshogi does not load",
+    )
     args = parser.parse_args()
 
-    save_npz(args.npz, load_torchscript_state_dict(args.model))
+    state_dict = load_torchscript_state_dict(args.model)
+    if not args.include_moves_left:
+        # dlshogi loads the parameters strictly, so leave out the moves-left head
+        state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith(MOVES_LEFT_PREFIX)
+        }
+    save_npz(args.npz, state_dict)
 
 
 if __name__ == "__main__":

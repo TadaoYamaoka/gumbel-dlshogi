@@ -18,6 +18,11 @@ import torch
 import torch.nn as nn
 
 from gumbel_dlshogi.common import save_atomically
+from gumbel_dlshogi.network.moves_left import (
+    MOVES_LEFT_SCALE,
+    has_moves_left,
+    with_moves_left,
+)
 
 _NETWORK_PATTERN = re.compile(
     r"(?P<type>[a-z]\w*?)(?P<blocks>\d+)(?:x(?P<channels>\d+))?(?:_fcl(?P<fcl>\d+))?"
@@ -80,20 +85,36 @@ def _resolve_network(network):
     return network_class, kwargs
 
 
-def policy_value_network(network, *, input2_channels):
+def policy_value_network(network, *, input2_channels, moves_left=False):
     """Creates the network given by its name.
 
     Args:
         network: Name of the network (see the module docstring)
         input2_channels: Number of planes of the input x2 (features2_num())
+        moves_left: Whether the network has the moves-left head, which makes it
+            return `(policy, value, moves_left)` (see network.moves_left)
 
     Raises:
-        ValueError: If the name does not give a network.
+        ValueError: If the name does not give a network, or the network does not
+            support the moves-left head.
     """
     network_class, kwargs = _resolve_network(network)
+    if moves_left:
+        network_class = with_moves_left(network_class)
     if "activation" in kwargs:
         kwargs["activation"] = kwargs["activation"]()
     return network_class(**kwargs, input2_channels=input2_channels)
+
+
+def add_moves_left_argument(parser):
+    """Adds the --moves_left argument (whether the network has the head)."""
+    parser.add_argument(
+        "--moves_left",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add the moves-left head to the network, which predicts the number of "
+        "plies until the end of the self-play game",
+    )
 
 
 def _network_type(network):
@@ -128,10 +149,35 @@ class PolicyValueNetworkAddSigmoid(nn.Module):
         return y1, torch.sigmoid(y2)
 
 
+class PolicyValueMovesLeftNetworkAddSigmoid(nn.Module):
+    """The wrapper for inference of a network with the moves-left head.
+
+    It returns the policy logits, the value as a win rate and the moves left as a
+    number of plies.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.base_model = model
+        # TorchScript does not use a global constant, so keep it as an attribute
+        self.moves_left_scale = MOVES_LEFT_SCALE
+
+    def forward(self, x1, x2):
+        y1, y2, y3 = self.base_model(x1, x2)
+        return y1, torch.sigmoid(y2), y3 * self.moves_left_scale
+
+
+def inference_wrapper(model):
+    """Wraps the network for inference (2 or 3 outputs by the moves-left head)."""
+    if has_moves_left(model):
+        return PolicyValueMovesLeftNetworkAddSigmoid(model)
+    return PolicyValueNetworkAddSigmoid(model)
+
+
 def save_torchscript_model(model, filepath):
     """Save model as TorchScript"""
     model.eval()
-    scripted_model = torch.jit.script(PolicyValueNetworkAddSigmoid(model))
+    scripted_model = torch.jit.script(inference_wrapper(model))
     save_atomically(filepath, lambda path: scripted_model.save(str(path)))
     print(f"TorchScript model saved to {filepath}")
 

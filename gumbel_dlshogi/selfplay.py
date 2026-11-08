@@ -26,9 +26,13 @@ from torch.amp import autocast
 from tqdm import tqdm
 
 from gumbel_dlshogi.common import (
+    MOVES_LEFT_FILE_EXT,
+    MOVES_LEFT_INVALID,
     POLICY_FILE_EXT,
     POSITION_FILE_EXT,
+    TEMPORARY_FILE_EXT,
     dtypeMovePolicy,
+    dtypeMovesLeft,
     dtypePosition,
 )
 from gumbel_dlshogi.features import (
@@ -49,6 +53,7 @@ from gumbel_dlshogi.mcts.base import EvaluationStep, RootFnOutput
 from gumbel_dlshogi.mcts.policies import _mask_invalid_actions, gumbel_muzero_policy
 from gumbel_dlshogi.mcts.qtransforms import qtransform_completed_by_mix_value
 from gumbel_dlshogi.mcts.search import MAX_MOVES
+from gumbel_dlshogi.network.moves_left import MOVES_LEFT_PREFIX
 from gumbel_dlshogi.start_positions import (
     SOURCES,
     STARTPOS,
@@ -57,10 +62,10 @@ from gumbel_dlshogi.start_positions import (
     check_roots_file,
 )
 from gumbel_dlshogi.network import (
-    PolicyValueNetworkAddSigmoid,
     add_compile_arguments,
     add_network_argument,
     compile_model,
+    inference_wrapper,
     load_torchscript_state_dict,
     policy_value_network,
     resolve_compile_options,
@@ -252,8 +257,15 @@ def write_training_data(
     os.makedirs(output_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    position_path = os.path.join(output_dir, timestamp + POSITION_FILE_EXT)
-    policy_path = os.path.join(output_dir, timestamp + POLICY_FILE_EXT)
+    # The files are written with temporary names, and published when completed. The
+    # position file is published last, since the data loader finds the files by it.
+    paths = [
+        os.path.join(output_dir, timestamp + ext)
+        for ext in (POLICY_FILE_EXT, MOVES_LEFT_FILE_EXT, POSITION_FILE_EXT)
+    ]
+    policy_path, moves_left_path, position_path = (
+        path + TEMPORARY_FILE_EXT for path in paths
+    )
 
     nyugyoku_count = 0
     draw_count = 0
@@ -297,9 +309,19 @@ def write_training_data(
                     if skip_max_moves:
                         continue
 
-            positions = np.empty(len(training_data.policy_outputs), dtype=dtypePosition)
+            num_positions_in_game = len(training_data.policy_outputs)
+            positions = np.empty(num_positions_in_game, dtype=dtypePosition)
             positions["hcp"] = training_data.hcps
             positions["result"] = result
+            # Plies until the end of the game: T - t for the position s_t
+            if training_data.is_max_moves:
+                moves_left = np.full(
+                    num_positions_in_game, MOVES_LEFT_INVALID, dtype=dtypeMovesLeft
+                )
+            else:
+                moves_left = np.arange(
+                    num_positions_in_game, 0, -1, dtype=dtypeMovesLeft
+                )
             move_policies = []
             for i, policy_output in enumerate(training_data.policy_outputs):
                 # 確率が0でない手だけを保存する(0の手は読み込み時に0で復元される)
@@ -310,9 +332,11 @@ def write_training_data(
                 move_policies.append(move_policy)
                 positions["num_moves"][i] = len(labels)
 
-            # 局面ファイルは方策ファイルを書いた後に追記する
+            # 局面ファイルは方策ファイルと残り手数ファイルを書いた後に追記する
             with open(policy_path, "ab") as f:
                 np.concatenate(move_policies).tofile(f)
+            with open(moves_left_path, "ab") as f:
+                moves_left.tofile(f)
             with open(position_path, "ab") as f:
                 positions.tofile(f)
 
@@ -333,6 +357,11 @@ def write_training_data(
                     "MaxMoves": max_moves_count,
                 }
             )
+
+    # Publish the files (closed above) if a game is saved, the position file last
+    if total_games > 0:
+        for path in paths:
+            os.replace(path + TEMPORARY_FILE_EXT, path)
 
     # Store final stats
     if stats_dict is not None:
@@ -424,9 +453,17 @@ def _check_compile(
             )
         network = model_settings["network"]
     check_torchscript_model(
-        model_path, network=network, use_nyugyoku_features=use_nyugyoku_features
+        model_path,
+        network=network,
+        use_nyugyoku_features=use_nyugyoku_features,
+        moves_left=_has_moves_left_parameters(load_torchscript_state_dict(model_path)),
     )
     return network
+
+
+def _has_moves_left_parameters(state_dict):
+    """Whether the parameters of the network include the moves-left head."""
+    return any(key.startswith(MOVES_LEFT_PREFIX) for key in state_dict)
 
 
 def _load_model(model_path, device, compile_options, network):
@@ -443,12 +480,15 @@ def _load_model(model_path, device, compile_options, network):
     if compile_options is None:
         return torch.jit.load(model_path, map_location=device).eval()
 
-    model = policy_value_network(network, input2_channels=features2_num())
-    model.load_state_dict(load_torchscript_state_dict(model_path))
-    model.to(device).eval()
-    return compile_model(
-        PolicyValueNetworkAddSigmoid(model).eval(), device, **compile_options
+    state_dict = load_torchscript_state_dict(model_path)
+    model = policy_value_network(
+        network,
+        input2_channels=features2_num(),
+        moves_left=_has_moves_left_parameters(state_dict),
     )
+    model.load_state_dict(state_dict)
+    model.to(device).eval()
+    return compile_model(inference_wrapper(model).eval(), device, **compile_options)
 
 
 def selfplay(
@@ -510,7 +550,10 @@ def selfplay(
 
             # Evaluate
             with torch.no_grad(), autocast(device.type, enabled=amp):
-                logits, value = model(x1.to(device), x2.to(device))
+                # A model with the moves-left head also returns the moves left,
+                # which the search does not use yet
+                outputs = model(x1.to(device), x2.to(device))
+                logits, value = outputs[0], outputs[1]
 
             _set_evaluations(actors, logits, value)
     except KeyboardInterrupt:
@@ -566,7 +609,9 @@ def selfplay_worker_mp(
 
         # Evaluate with lock
         with lock, torch.no_grad(), autocast(device.type, enabled=amp):
-            logits, value = model(x1.to(device), x2.to(device))
+            # The moves left of a model with the head is not used yet
+            outputs = model(x1.to(device), x2.to(device))
+            logits, value = outputs[0], outputs[1]
 
         _set_evaluations(actors, logits, value)
 

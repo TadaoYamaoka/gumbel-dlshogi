@@ -102,12 +102,18 @@ class PolicyValueNetwork(nn.Module):
         self.value_fc2 = nn.Linear(fcl, 1)
 
     def forward(self, x1, x2):
+        return self.policy_value(self.features(x1, x2))
+
+    def features(self, x1, x2):
+        """Returns the output of the shared layers, used by the heads."""
         x = self.l1_1_1(x1) + self.l1_1_2(x1) + self.l1_2(x2)
         x = self.act(self.norm1(x))
 
         # resnet blocks
-        x = self.blocks(x)
+        return self.blocks(x)
 
+    def policy_value(self, x):
+        """Returns the policy logits and the value logit from the features."""
         # policy head
         policy = self.policy_bias(self.policy(x).flatten(1))
 

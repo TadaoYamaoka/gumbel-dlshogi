@@ -7,9 +7,12 @@ from cshogi import BLACK, BLACK_WIN, WHITE, WHITE_WIN, Board, HuffmanCodedPosAnd
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from gumbel_dlshogi.common import (
+    MOVES_LEFT_FILE_EXT,
+    MOVES_LEFT_INVALID,
     POLICY_FILE_EXT,
     POSITION_FILE_EXT,
     dtypeMovePolicy,
+    dtypeMovesLeft,
     dtypePosition,
 )
 from gumbel_dlshogi.features import (
@@ -67,9 +70,12 @@ def worker_init_fn(worker_id):
 class TrainingDataset(Dataset):
     def __init__(self, data_dir, num_files=None, use_nyugyoku_features=False):
         """
+        The moves left file (.moves_left) is optional: without it (e.g. the data
+        written by an older version), the moves left of its positions are invalid.
+
         Args:
-            data_dir: Directory containing the position (.pos) and policy (.policy)
-                files written by self-play
+            data_dir: Directory containing the position (.pos), policy (.policy) and
+                moves left (.moves_left) files written by self-play
             num_files: Number of newest files to use (None for all)
             use_nyugyoku_features: Whether to use nyugyoku features
         """
@@ -100,6 +106,11 @@ class TrainingDataset(Dataset):
             policy_size = os.path.getsize(self._policy_file(file))
             if move_offsets[-1] * dtypeMovePolicy.itemsize != policy_size:
                 raise ValueError(f"The policy file does not match {file}")
+            moves_left_file = self._moves_left_file(file)
+            if os.path.exists(moves_left_file):
+                moves_left_size = os.path.getsize(moves_left_file)
+                if (len(num_moves) * dtypeMovesLeft.itemsize) != moves_left_size:
+                    raise ValueError(f"The moves left file does not match {file}")
             self.move_offsets.append(move_offsets)
 
         # Global index where each file starts (the last element is the total)
@@ -115,6 +126,10 @@ class TrainingDataset(Dataset):
     def _policy_file(position_file):
         return os.path.splitext(position_file)[0] + POLICY_FILE_EXT
 
+    @staticmethod
+    def _moves_left_file(position_file):
+        return os.path.splitext(position_file)[0] + MOVES_LEFT_FILE_EXT
+
     def __getstate__(self):
         # Do not pickle the memory maps (they would be copied as arrays)
         state = self.__dict__.copy()
@@ -123,17 +138,24 @@ class TrainingDataset(Dataset):
         return state
 
     def _get_mmaps(self, file_index):
-        """Get or create memory maps for the position and policy files"""
+        """Get or create memory maps for the position, policy and moves left files
+
+        The moves left map is None if the file does not exist.
+        """
         if file_index not in self._mmaps:
             file = self.files[file_index]
+            moves_left_file = self._moves_left_file(file)
             self._mmaps[file_index] = (
                 np.memmap(file, dtype=dtypePosition, mode="r"),
                 np.memmap(self._policy_file(file), dtype=dtypeMovePolicy, mode="r"),
+                np.memmap(moves_left_file, dtype=dtypeMovesLeft, mode="r")
+                if os.path.exists(moves_left_file)
+                else None,
             )
         return self._mmaps[file_index]
 
     def _read_samples(self, indices):
-        """Reads the positions and policies at the indices, keeping their order"""
+        """Reads the positions, policies and moves left at the indices in order"""
         if np.any((indices < 0) | (indices >= self.total_samples)):
             raise IndexError(f"Index out of range: {indices}")
         file_indices = np.searchsorted(self.file_starts, indices, side="right") - 1
@@ -141,11 +163,15 @@ class TrainingDataset(Dataset):
         positions = np.empty(len(indices), dtype=dtypePosition)
         # Only moves with non-zero probability are stored; the others stay zero
         policies = np.zeros((len(indices), MOVE_LABELS_NUM), dtype=np.float32)
+        # Invalid unless the moves left file exists
+        moves_left = np.full(len(indices), MOVES_LEFT_INVALID, dtype=np.int32)
         for file_index in np.unique(file_indices):
             rows = np.flatnonzero(file_indices == file_index)
             local_indices = indices[rows] - self.file_starts[file_index]
-            position_mmap, policy_mmap = self._get_mmaps(file_index)
+            position_mmap, policy_mmap, moves_left_mmap = self._get_mmaps(file_index)
             positions[rows] = position_mmap[local_indices]
+            if moves_left_mmap is not None:
+                moves_left[rows] = moves_left_mmap[local_indices]
 
             # Gather the stored moves of each position and scatter them to its row
             move_offsets = self.move_offsets[file_index]
@@ -158,21 +184,34 @@ class TrainingDataset(Dataset):
             )
             moves = policy_mmap[move_indices]
             policies[np.repeat(rows, counts), moves["label"]] = moves["prob"]
-        return positions, policies
+        return positions, policies, moves_left
 
     def __len__(self):
         return self.total_samples
 
     def __getitems__(self, indices):
-        """Builds a whole batch at once (used by DataLoader)"""
-        positions, policies = self._read_samples(np.asarray(indices, dtype=np.int64))
+        """Builds a whole batch at once (used by DataLoader)
+
+        Returns:
+            `(features1, features2, policies, results, moves_left)`. moves_left is
+            the number of plies (int32), MOVES_LEFT_INVALID if it is unknown.
+        """
+        positions, policies, moves_left = self._read_samples(
+            np.asarray(indices, dtype=np.int64)
+        )
 
         if self._board is None:
             self._board = Board()
         features1, features2, turns = _make_features(self._board, positions["hcp"])
         results = _make_results(positions["result"], turns)
 
-        return features1, features2, torch.from_numpy(policies), results
+        return (
+            features1,
+            features2,
+            torch.from_numpy(policies),
+            results,
+            torch.from_numpy(moves_left),
+        )
 
     def __getitem__(self, idx):
         return tuple(t[0] for t in self.__getitems__([idx]))

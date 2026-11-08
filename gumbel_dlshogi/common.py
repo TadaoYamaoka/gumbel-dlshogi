@@ -41,3 +41,13 @@ dtypeMovePolicy = np.dtype(
         ("prob", np.float32),
     ]
 )
+
+# 残り手数ファイル(固定長): 局面ファイルと同じ並びで、自己対局の終了判定までの手数(ply)。
+# 局面 s_0, ..., s_{T-1} の後に終了判定した対局なら、s_t の値は T - t になる。
+MOVES_LEFT_FILE_EXT = ".moves_left"
+dtypeMovesLeft = np.dtype(np.uint16)
+# 手数上限で打ち切った対局の値(本当の残り手数は分からないので学習に使わない)
+MOVES_LEFT_INVALID = 0xFFFF
+
+# 生成中のファイルに付ける拡張子。書き終えてから正式な名前で公開する
+TEMPORARY_FILE_EXT = ".tmp"

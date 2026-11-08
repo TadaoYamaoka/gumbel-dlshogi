@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import random
 import socket
@@ -9,17 +10,19 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from gumbel_dlshogi.common import save_atomically
+from gumbel_dlshogi.common import MOVES_LEFT_INVALID, save_atomically
 from gumbel_dlshogi.data_loader import create_dataloader, create_test_dataloader
 from gumbel_dlshogi.features import features2_num, set_nyugyoku_features
 from gumbel_dlshogi.network import (
     add_compile_arguments,
+    add_moves_left_argument,
     add_network_argument,
     compile_model,
     policy_value_network,
@@ -27,13 +30,74 @@ from gumbel_dlshogi.network import (
     save_torchscript_model,
 )
 
+from gumbel_dlshogi.network.moves_left import MOVES_LEFT_SCALE
+
 _NCCL_REQUIRED = "Training on 2 or more GPUs needs NCCL, which is available on Linux"
+
+# Sums of the moves-left loss over the epoch, which are summed over the processes
+_MOVES_LEFT_SUMS = ("moves_left_loss_sum", "moves_left_error_sum", "moves_left_count")
+
+
+def _moves_left_loss(prediction, targets):
+    """Returns the moves-left loss of the batch, and the sums for the metrics.
+
+    The targets are numbers of plies, MOVES_LEFT_INVALID if unknown (games ended by
+    the maximum number of moves), which are masked. The loss is the Huber loss of the
+    plies divided by MOVES_LEFT_SCALE, averaged over the valid positions of all the
+    processes in data parallel training: DDP averages the gradients of the processes,
+    so each process divides its sum by the valid positions of all of them per process.
+    A batch without valid positions gives 0 connected to the head, without NaN.
+    """
+    valid = targets != MOVES_LEFT_INVALID
+    # Replace the invalid targets before computing the loss, then mask them
+    safe_targets = torch.where(valid, targets, 0).float() / MOVES_LEFT_SCALE
+    prediction = prediction.squeeze(-1).float()
+    mask = valid.float()
+    loss_sum = (F.huber_loss(prediction, safe_targets, reduction="none") * mask).sum()
+
+    count = valid.sum()
+    total_count = count.clone()
+    world_size = 1
+    if dist.is_initialized():
+        dist.all_reduce(total_count)
+        world_size = dist.get_world_size()
+    loss = loss_sum * world_size / total_count.clamp(min=1)
+
+    error_sum = ((prediction - safe_targets).abs() * mask).sum() * MOVES_LEFT_SCALE
+    # Tensors on the device, so that the metrics do not synchronize before backward
+    return loss, {
+        "moves_left_loss_sum": loss_sum.detach(),
+        "moves_left_error_sum": error_sum.detach(),
+        "moves_left_count": count,
+    }
+
+
+def _moves_left_metrics(sums):
+    """Returns the moves-left loss and the mean absolute error (plies) per position."""
+    count = max(sums["moves_left_count"], 1)
+    return {
+        "moves_left_loss": sums["moves_left_loss_sum"] / count,
+        "moves_left_mae": sums["moves_left_error_sum"] / count,
+        "moves_left_positions": sums["moves_left_count"],
+    }
 
 
 def train_epoch(
-    model, dataloader, optimizer, scaler, device, amp_enabled=True, progress=True
+    model,
+    dataloader,
+    optimizer,
+    scaler,
+    device,
+    amp_enabled=True,
+    progress=True,
+    moves_left_loss_weight=0.0,
 ):
-    """Train for one epoch"""
+    """Train for one epoch
+
+    If the model has the moves-left head (3 outputs), the moves-left loss times
+    moves_left_loss_weight is added, and the sums for its metrics are returned (see
+    _moves_left_metrics).
+    """
     model.train()
 
     policy_criterion = nn.CrossEntropyLoss()
@@ -43,10 +107,17 @@ def train_epoch(
     policy_loss_sum = 0.0
     value_loss_sum = 0.0
     num_batches = 0
+    moves_left_sums = {}
 
     pbar = tqdm(dataloader, desc="Training", unit="batch", disable=not progress)
     with pbar:
-        for features1, features2, policy_targets, value_targets in pbar:
+        for (
+            features1,
+            features2,
+            policy_targets,
+            value_targets,
+            moves_left_targets,
+        ) in pbar:
             features1 = features1.to(device)
             features2 = features2.to(device)
             policy_targets = policy_targets.to(device)
@@ -55,7 +126,8 @@ def train_epoch(
             optimizer.zero_grad()
 
             with autocast(device.type, enabled=amp_enabled):
-                policy_output, value_output = model(features1, features2)
+                outputs = model(features1, features2)
+                policy_output, value_output = outputs[0], outputs[1]
 
                 # Policy loss - targets are probability distributions
                 policy_loss = policy_criterion(policy_output, policy_targets)
@@ -64,6 +136,17 @@ def train_epoch(
                 value_loss = value_criterion(value_output.squeeze(-1), value_targets)
 
                 total_batch_loss = policy_loss + value_loss
+
+            if len(outputs) == 3:
+                moves_left_loss, sums = _moves_left_loss(
+                    outputs[2], moves_left_targets.to(device)
+                )
+                total_batch_loss = total_batch_loss + (
+                    moves_left_loss_weight * moves_left_loss
+                )
+                # Summed on the device, and read at the end of the epoch
+                for key, value in sums.items():
+                    moves_left_sums[key] = moves_left_sums.get(key, 0) + value
 
             scaler.scale(total_batch_loss).backward()
             scaler.step(optimizer)
@@ -83,11 +166,14 @@ def train_epoch(
                 }
             )
 
-    return {
+    metrics = {
         "total_loss": total_loss / num_batches,
         "policy_loss": policy_loss_sum / num_batches,
         "value_loss": value_loss_sum / num_batches,
     }
+    # Empty without the moves-left head
+    metrics.update({key: value.item() for key, value in moves_left_sums.items()})
+    return metrics
 
 
 def evaluate(model, dataloader, device, amp_enabled=True):
@@ -113,7 +199,9 @@ def evaluate(model, dataloader, device, amp_enabled=True):
                 value_targets = value_targets.to(device)
 
                 with autocast(device.type, enabled=amp_enabled):
-                    policy_output, value_output = model(features1, features2)
+                    # The test data have no moves left (the head is not evaluated)
+                    outputs = model(features1, features2)
+                    policy_output, value_output = outputs[0], outputs[1]
 
                     # For test data, policy_targets are labels (long), not distributions
                     policy_loss = policy_criterion(policy_output, policy_targets)
@@ -160,13 +248,32 @@ def evaluate(model, dataloader, device, amp_enabled=True):
     }
 
 
-def _average_metrics(metrics, device):
-    """Averages the metrics of the processes in data parallel training."""
+def _reduce_metrics(metrics, device, average=True):
+    """Averages (or sums) the metrics of the processes in data parallel training."""
     keys = sorted(metrics)
-    values = torch.tensor([metrics[key] for key in keys], device=device)
+    values = torch.tensor(
+        [metrics[key] for key in keys], dtype=torch.float64, device=device
+    )
     dist.all_reduce(values)
-    values /= dist.get_world_size()
+    if average:
+        values /= dist.get_world_size()
     return dict(zip(keys, values.tolist()))
+
+
+def _epoch_metrics(metrics, device, distributed):
+    """Returns the metrics of the epoch from those of train_epoch() in the process.
+
+    The losses of the batches are averaged over the processes, and the moves-left
+    metrics are computed from the sums over the processes.
+    """
+    sums = {key: metrics.pop(key) for key in _MOVES_LEFT_SUMS if key in metrics}
+    if distributed:
+        metrics = _reduce_metrics(metrics, device)
+        if sums:
+            sums = _reduce_metrics(sums, device, average=False)
+    if sums:
+        metrics.update(_moves_left_metrics(sums))
+    return metrics
 
 
 def save_checkpoint(model, optimizer, scaler, epoch, total_steps, loss, filepath):
@@ -227,10 +334,14 @@ def train(
     use_nyugyoku_features=False,
     compile_options=None,
     gpus=None,
+    moves_left=False,
+    moves_left_loss_weight=0.1,
 ):
     """Main training function
 
     Args:
+        moves_left: Whether the network has the moves-left head
+        moves_left_loss_weight: Weight of the moves-left loss (with the head)
         batch_size: Batch size of a step. In data parallel training, each GPU trains
             batch_size / len(gpus) samples of it.
         compile_options: If not None, the model is compiled with torch.compile by
@@ -329,6 +440,8 @@ def _train(
     save_torchscript,
     use_nyugyoku_features,
     compile_options,
+    moves_left,
+    moves_left_loss_weight,
 ):
     """Trains the model in a process (of world_size processes in data parallel).
 
@@ -352,7 +465,9 @@ def _train(
         writer = SummaryWriter(log_dir=log_dir_path)
 
     # Create model
-    model = policy_value_network(network, input2_channels=features2_num()).to(device)
+    model = policy_value_network(
+        network, input2_channels=features2_num(), moves_left=moves_left
+    ).to(device)
 
     # Load initial model if specified
     if initial_model:
@@ -427,9 +542,9 @@ def _train(
             device,
             amp,
             progress=is_main,
+            moves_left_loss_weight=moves_left_loss_weight,
         )
-        if distributed:
-            train_metrics = _average_metrics(train_metrics, device)
+        train_metrics = _epoch_metrics(train_metrics, device, distributed)
         train_time = time.time() - start_time
 
         # Update total steps
@@ -439,7 +554,13 @@ def _train(
             f"Train - Loss: {train_metrics['total_loss']:.4f}, "
             f"Policy Loss: {train_metrics['policy_loss']:.4f}, "
             f"Value Loss: {train_metrics['value_loss']:.4f}, "
-            f"Time: {train_time:.2f}s, "
+            + (
+                f"Moves Left Loss: {train_metrics['moves_left_loss']:.4f}, "
+                f"Moves Left MAE: {train_metrics['moves_left_mae']:.1f}, "
+                if "moves_left_loss" in train_metrics
+                else ""
+            )
+            + f"Time: {train_time:.2f}s, "
             f"Total Steps: {total_steps}"
         )
 
@@ -454,6 +575,9 @@ def _train(
             writer.add_scalar(
                 "train/value_loss", train_metrics["value_loss"], total_steps
             )
+            for key in ("moves_left_loss", "moves_left_mae", "moves_left_positions"):
+                if key in train_metrics:
+                    writer.add_scalar(f"train/{key}", train_metrics[key], total_steps)
 
         # Evaluation
         if test_dataloader and (epoch + 1) % eval_interval == 0:
@@ -531,6 +655,29 @@ def gpu_ids(value):
     return ids
 
 
+def _non_negative_float(value):
+    """argparse type of a finite number of 0 or more"""
+    try:
+        number = float(value)
+    except ValueError:
+        number = math.nan
+    if not (math.isfinite(number) and number >= 0):
+        raise argparse.ArgumentTypeError(
+            f"It must be a finite number of 0 or more: {value!r}"
+        )
+    return number
+
+
+def add_moves_left_loss_weight_argument(parser):
+    """Adds the argument of the weight of the moves-left loss."""
+    parser.add_argument(
+        "--moves_left_loss_weight",
+        type=_non_negative_float,
+        default=0.1,
+        help="Weight of the moves-left loss, used with --moves_left",
+    )
+
+
 def add_gpus_argument(parser, name="--gpus"):
     """Adds the argument of the GPUs to train on."""
     parser.add_argument(
@@ -558,6 +705,7 @@ def main():
 
     # Model arguments
     add_network_argument(parser)
+    add_moves_left_argument(parser)
     parser.add_argument(
         "--use_nyugyoku_features",
         action="store_true",
@@ -576,6 +724,7 @@ def main():
     )
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
+    add_moves_left_loss_weight_argument(parser)
     parser.add_argument(
         "--num_workers",
         type=int,
@@ -652,6 +801,8 @@ def main():
         use_nyugyoku_features=args.use_nyugyoku_features,
         compile_options=compile_options,
         gpus=args.gpus,
+        moves_left=args.moves_left,
+        moves_left_loss_weight=args.moves_left_loss_weight,
     )
 
 

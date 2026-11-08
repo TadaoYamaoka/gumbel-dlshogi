@@ -7,11 +7,13 @@ import torch
 from gumbel_dlshogi.common import save_atomically
 from gumbel_dlshogi.features import features2_num, set_nyugyoku_features
 from gumbel_dlshogi.network import (
+    add_moves_left_argument,
     add_network_argument,
     load_torchscript_state_dict,
     policy_value_network,
     save_torchscript_model,
 )
+from gumbel_dlshogi.network.moves_left import MOVES_LEFT_PREFIX
 from gumbel_dlshogi.serializers import load_npz
 
 
@@ -52,6 +54,14 @@ def _read_settings_record(model_path):
     return record
 
 
+def normalize_model_settings(model_settings):
+    """Returns the model settings with the defaults of the settings added later.
+
+    The records written before the moves-left head have no "moves_left".
+    """
+    return {"moves_left": False, **model_settings}
+
+
 def read_model_settings(model_path):
     """Returns the settings that the model file was saved with.
 
@@ -61,30 +71,38 @@ def read_model_settings(model_path):
     record = _read_settings_record(model_path)
     if record is None or Path(model_path).name not in record["files"]:
         return None
-    return record["model_settings"]
+    return normalize_model_settings(record["model_settings"])
 
 
-def check_model_state(state_dict_path, *, network, use_nyugyoku_features):
+def check_model_state(
+    state_dict_path, *, network, use_nyugyoku_features, moves_left=False
+):
     """Raises ValueError if the saved state dict does not match the model settings."""
     _check_model_file(
         state_dict_path,
         torch.load(state_dict_path, map_location="cpu"),
         network=network,
         use_nyugyoku_features=use_nyugyoku_features,
+        moves_left=moves_left,
     )
 
 
-def check_torchscript_model(torchscript_path, *, network, use_nyugyoku_features):
+def check_torchscript_model(
+    torchscript_path, *, network, use_nyugyoku_features, moves_left=False
+):
     """Raises ValueError if the TorchScript model does not match the model settings."""
     _check_model_file(
         torchscript_path,
         load_torchscript_state_dict(torchscript_path),
         network=network,
         use_nyugyoku_features=use_nyugyoku_features,
+        moves_left=moves_left,
     )
 
 
-def _check_model_file(model_path, actual, *, network, use_nyugyoku_features):
+def _check_model_file(
+    model_path, actual, *, network, use_nyugyoku_features, moves_left
+):
     """Raises ValueError if the model file does not match the model settings.
 
     The settings saved with the file must be the same. The parameters do not
@@ -101,6 +119,7 @@ def _check_model_file(model_path, actual, *, network, use_nyugyoku_features):
     model_settings = {
         "network": network,
         "use_nyugyoku_features": use_nyugyoku_features,
+        "moves_left": moves_left,
     }
     record = _read_settings_record(model_path)
     if record is None:
@@ -114,13 +133,13 @@ def _check_model_file(model_path, actual, *, network, use_nyugyoku_features):
             f"{model_path} is not one of the files saved with the settings "
             f"{settings_path(model_path)}, so it may be left from an earlier save"
         )
-    elif record["model_settings"] != model_settings:
+    elif normalize_model_settings(record["model_settings"]) != model_settings:
         raise ValueError(f"{model_path} was created with {record['model_settings']}")
 
     set_nyugyoku_features(use_nyugyoku_features)
     with torch.device("meta"):
         expected = policy_value_network(
-            network, input2_channels=features2_num()
+            network, input2_channels=features2_num(), moves_left=moves_left
         ).state_dict()
     _check_parameters(
         model_path,
@@ -128,11 +147,12 @@ def _check_model_file(model_path, actual, *, network, use_nyugyoku_features):
         actual,
         network=network,
         use_nyugyoku_features=use_nyugyoku_features,
+        moves_left=moves_left,
     )
 
 
 def _check_parameters(
-    model_path, expected, actual, *, network, use_nyugyoku_features
+    model_path, expected, actual, *, network, use_nyugyoku_features, moves_left
 ):
     """Raises ValueError if the names or shapes of the parameters differ."""
     mismatches = sorted(
@@ -148,7 +168,7 @@ def _check_parameters(
             details += ", ..."
         raise ValueError(
             f"{model_path} does not match network={network}, "
-            f"use_nyugyoku_features={use_nyugyoku_features} "
+            f"use_nyugyoku_features={use_nyugyoku_features}, moves_left={moves_left} "
             f"(mismatched parameters: {details})"
         )
 
@@ -159,6 +179,7 @@ def create_initial_model(
     *,
     network,
     use_nyugyoku_features,
+    moves_left=False,
     save_torchscript=True,
     save_state_dict_file=True,
     npz=None,
@@ -170,8 +191,11 @@ def create_initial_model(
     do not determine.
 
     Args:
+        moves_left: Whether the network has the moves-left head
         npz: Model file (.npz, e.g. of dlshogi) to initialize the model with. It
             must be the network given by `network` (the activation is not checked).
+            If it has none of the parameters of the moves-left head (e.g. a model
+            without the head), the head is initialized.
 
     Returns:
         `(torchscript_path, state_dict_path)`. A path is None if it was not saved.
@@ -183,16 +207,28 @@ def create_initial_model(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     set_nyugyoku_features(use_nyugyoku_features)
-    print(f"Creating initial model {network}")
-    model = policy_value_network(network, input2_channels=features2_num())
+    print(
+        f"Creating initial model {network}"
+        + (" with the moves-left head" if moves_left else "")
+    )
+    model = policy_value_network(
+        network, input2_channels=features2_num(), moves_left=moves_left
+    )
     if npz:
         state_dict = load_npz(npz)
+        expected = model.state_dict()
+        head_keys = [key for key in expected if key.startswith(MOVES_LEFT_PREFIX)]
+        if head_keys and not any(key in state_dict for key in head_keys):
+            # Only a file without the whole head is allowed (a part of it is broken)
+            state_dict.update({key: expected[key] for key in head_keys})
+            print(f"The moves-left head is initialized ({npz} does not have it)")
         _check_parameters(
             npz,
-            model.state_dict(),
+            expected,
             state_dict,
             network=network,
             use_nyugyoku_features=use_nyugyoku_features,
+            moves_left=moves_left,
         )
         model.load_state_dict(state_dict)
         print(f"Initialized with the npz model {npz}")
@@ -225,7 +261,11 @@ def create_initial_model(
     if saved_files:
         save_model_settings(
             model_settings_path,
-            {"network": network, "use_nyugyoku_features": use_nyugyoku_features},
+            {
+                "network": network,
+                "use_nyugyoku_features": use_nyugyoku_features,
+                "moves_left": moves_left,
+            },
             saved_files,
         )
 
@@ -239,6 +279,7 @@ def main():
 
     # Model arguments
     add_network_argument(parser)
+    add_moves_left_argument(parser)
     parser.add_argument(
         "--use_nyugyoku_features",
         action="store_true",
@@ -285,6 +326,7 @@ def main():
             args.model_name,
             network=args.network,
             use_nyugyoku_features=args.use_nyugyoku_features,
+            moves_left=args.moves_left,
             save_torchscript=args.save_torchscript,
             save_state_dict_file=args.save_state_dict,
             npz=args.npz,
