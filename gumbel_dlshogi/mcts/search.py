@@ -61,8 +61,9 @@ def search(
             yield step
         else:
             # Terminal nodes use the game result instead of the network evaluation.
-            # No action is selected from them, so no prior logits are needed.
-            step = base.EvaluationStep(value=terminal_value)
+            # No action is selected from them, so no prior logits are needed. The
+            # game ends there, so no moves are left.
+            step = base.EvaluationStep(value=terminal_value, moves_left=np.float32(0))
         expand(
             tree,
             step,
@@ -215,7 +216,9 @@ def expand(
     """
 
     # Evaluate and create a new node.
-    update_tree_node(tree, next_node_index, step.prior_logits, step.value)
+    update_tree_node(
+        tree, next_node_index, step.prior_logits, step.value, step.moves_left
+    )
 
     # Return updated tree topology.
     tree.children_index[parent_index, action] = next_node_index
@@ -228,7 +231,8 @@ def backward(board: Board, tree: Tree, leaf_index: np.int32):
 
     The values are win rates of the side to move in [0, 1], so a value is turned
     to the parent's side by `1 - value` (mctx uses the discount -1 for the values
-    in [-1, 1] of two-player games).
+    in [-1, 1] of two-player games). The moves left are averaged in the same way,
+    adding a ply for each level instead of turning them.
 
     Args:
       board: the reached position, moved back to the root.
@@ -237,31 +241,41 @@ def backward(board: Board, tree: Tree, leaf_index: np.int32):
     """
 
     def cond_fun(loop_state):
-        _, index = loop_state
+        _, _, index = loop_state
         return index != Tree.ROOT_INDEX
 
     def body_fun(loop_state):
         # Here we update the value of our parent, so we start by reversing.
-        leaf_value, index = loop_state
+        leaf_value, leaf_moves_left, index = loop_state
         leaf_value = 1 - leaf_value
+        # The parent is a ply further from the end of the game
+        leaf_moves_left = leaf_moves_left + 1
         parent = tree.parents[index]
         count = tree.node_visits[parent]
         action = tree.action_from_parent[index]
         parent_value = (tree.node_values[parent] * count + leaf_value) / (count + 1.0)
+        parent_moves_left = (
+            tree.node_moves_left[parent] * count + leaf_moves_left
+        ) / (count + 1.0)
         children_value = tree.node_values[index]
         children_count = tree.children_visits[parent, action] + 1
 
         tree.node_values[parent] = parent_value
+        tree.node_moves_left[parent] = parent_moves_left
         tree.node_visits[parent] = count + 1
         tree.children_values[parent, action] = 1 - children_value
         tree.children_visits[parent, action] = children_count
 
         board.pop()
 
-        return leaf_value, parent
+        return leaf_value, leaf_moves_left, parent
 
     leaf_index = np.asarray(leaf_index, dtype=np.int32)
-    loop_state = (tree.node_values[leaf_index], leaf_index)
+    loop_state = (
+        tree.node_values[leaf_index],
+        tree.node_moves_left[leaf_index],
+        leaf_index,
+    )
     while cond_fun(loop_state):
         loop_state = body_fun(loop_state)
 
@@ -271,6 +285,7 @@ def update_tree_node(
     node_index: np.int32,
     prior_logits: Optional[np.ndarray],
     value: np.float32,
+    moves_left: Optional[np.float32] = None,
 ):
     """Updates the tree at node index in place.
 
@@ -282,6 +297,9 @@ def update_tree_node(
         Unlike mctx, their softmax is also stored (`children_prior_probs`), since
         the Q-value transformation uses it at each selection.
       value: the value to fill in for the new node.
+      moves_left: the moves left to fill in for the new node (0 for a terminal
+        node, which keeps 0 when it is reached again). None without the moves-left
+        head, which is filled in as 0.
     """
 
     new_visit = tree.node_visits[node_index] + 1
@@ -292,6 +310,9 @@ def update_tree_node(
         tree.children_prior_probs[node_index] = softmax(prior_logits)
     tree.raw_values[node_index] = value
     tree.node_values[node_index] = value
+    moves_left = 0 if moves_left is None else moves_left
+    tree.raw_moves_left[node_index] = moves_left
+    tree.node_moves_left[node_index] = moves_left
     tree.node_visits[node_index] = new_visit
 
 
@@ -321,6 +342,8 @@ def instantiate_tree_from_root(
         children_prior_probs=np.zeros(
             (num_nodes, num_actions), dtype=root.prior_logits.dtype
         ),
+        raw_moves_left=np.zeros(num_nodes, dtype=np.float32),
+        node_moves_left=np.zeros(num_nodes, dtype=np.float32),
         children_values=np.zeros((num_nodes, num_actions), dtype=np.float32),
         children_visits=np.zeros((num_nodes, num_actions), dtype=np.int32),
         root_invalid_actions=root_invalid_actions,
@@ -328,5 +351,8 @@ def instantiate_tree_from_root(
     )
 
     root_index = Tree.ROOT_INDEX
-    update_tree_node(tree, root_index, root.prior_logits, root.value)
+    # The first visit of the root has its predicted moves left, like its value
+    update_tree_node(
+        tree, root_index, root.prior_logits, root.value, root.moves_left
+    )
     return tree

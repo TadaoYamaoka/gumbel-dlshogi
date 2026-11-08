@@ -30,6 +30,11 @@ class Tree:
       computed once when the node is expanded.
     children_visits: `[N, num_actions]` the visit counts for children for
       each action.
+    raw_moves_left: `[N]` the number of plies until the end of the game predicted
+      for each node (0 for a terminal node, and without the moves-left head).
+    node_moves_left: `[N]` the number of plies until the end of the game averaged
+      by the visits for each node, like node_values. A ply is added for each level
+      going up, without turning it to the other side.
     children_values: `[N, num_actions]` the value of the next node after the
       action, from the side to move at the parent (`1 - value of the child`).
     root_invalid_actions: `[num_actions]` a mask with invalid actions at the
@@ -46,6 +51,8 @@ class Tree:
     children_prior_logits: np.ndarray  # [N, num_actions]
     children_prior_probs: np.ndarray  # [N, num_actions]
     children_visits: np.ndarray  # [N, num_actions]
+    raw_moves_left: np.ndarray  # [N]
+    node_moves_left: np.ndarray  # [N]
     children_values: np.ndarray  # [N, num_actions]
     root_invalid_actions: np.ndarray  # [num_actions]
     extra_data: Any

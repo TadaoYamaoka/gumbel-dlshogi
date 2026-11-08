@@ -22,8 +22,9 @@ from gumbel_dlshogi.network import (
     resolve_compile_options,
 )
 from gumbel_dlshogi.selfplay import (
+    add_moves_left_search_arguments,
     add_qtransform_arguments,
-    make_qtransform,
+    make_qtransforms,
     selfplay_multiprocess,
 )
 from gumbel_dlshogi.start_positions import (
@@ -206,6 +207,7 @@ def main():
     parser.add_argument("--num_processes", type=int, default=4)
     parser.add_argument("--skip_max_moves", action="store_true")
     add_qtransform_arguments(parser)
+    add_moves_left_search_arguments(parser)
     add_start_positions_arguments(parser)
 
     # Training arguments
@@ -256,6 +258,9 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.moves_left_beta > 0 and not args.moves_left:
+        parser.error("--moves_left_beta needs a model with the moves-left head.")
+    qtransform, target_qtransform = make_qtransforms(args)
     if args.roots is not None:
         try:
             check_roots_file(args.roots)
@@ -425,7 +430,8 @@ def main():
             use_nyugyoku_features=args.use_nyugyoku_features,
             compile_options=compile_options if args.selfplay_compile else None,
             network=args.network,
-            qtransform=make_qtransform(args.value_scale, args.rescale_values),
+            qtransform=qtransform,
+            target_qtransform=target_qtransform,
             roots=args.roots,
             roots_ratio=args.roots_ratio,
         )
@@ -447,6 +453,12 @@ def main():
             writer.add_scalar(
                 "parameters/selfplay/value_scale", args.value_scale, current_cycle_num
             )
+            for name in ("beta", "tau", "threshold", "target"):
+                writer.add_scalar(
+                    f"parameters/selfplay/moves_left_{name}",
+                    float(getattr(args, f"moves_left_{name}")),
+                    current_cycle_num,
+                )
             writer.add_scalar(
                 "parameters/selfplay/rescale_values",
                 int(args.rescale_values),

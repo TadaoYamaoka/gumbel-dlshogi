@@ -51,7 +51,10 @@ from gumbel_dlshogi.mcts import base
 from gumbel_dlshogi.mcts.action_selection import init_table
 from gumbel_dlshogi.mcts.base import EvaluationStep, RootFnOutput
 from gumbel_dlshogi.mcts.policies import _mask_invalid_actions, gumbel_muzero_policy
-from gumbel_dlshogi.mcts.qtransforms import qtransform_completed_by_mix_value
+from gumbel_dlshogi.mcts.qtransforms import (
+    qtransform_completed_by_mix_value,
+    qtransform_with_moves_left,
+)
 from gumbel_dlshogi.mcts.search import MAX_MOVES
 from gumbel_dlshogi.network.moves_left import MOVES_LEFT_PREFIX
 from gumbel_dlshogi.start_positions import (
@@ -105,11 +108,13 @@ class Actor:
         debug=False,
         qtransform=qtransform_completed_by_mix_value,
         start_positions=None,
+        target_qtransform=None,
     ):
         self.board = Board()
         self.max_num_considered_actions = max_num_considered_actions
         self.num_simulations = num_simulations
         self.qtransform = qtransform
+        self.target_qtransform = target_qtransform
         self.start_positions = (
             StartPositions() if start_positions is None else start_positions
         )
@@ -141,7 +146,9 @@ class Actor:
 
         if self.generator is None:
             self.root = RootFnOutput(
-                prior_logits=self.step.prior_logits, value=self.step.value
+                prior_logits=self.step.prior_logits,
+                value=self.step.value,
+                moves_left=self.step.moves_left,
             )
             invalid_actions = _get_invalid_actions(self.board)
             self.generator = gumbel_muzero_policy(
@@ -151,6 +158,7 @@ class Actor:
                 invalid_actions,
                 self.max_num_considered_actions,
                 qtransform=self.qtransform,
+                target_qtransform=self.target_qtransform,
             )
 
         try:
@@ -234,17 +242,24 @@ def _step_actors(actors, x1, x2):
         make_input_features(actor.board, features1[i], features2[i])
 
 
-def _set_evaluations(actors, logits, value):
-    """推論結果を各 Actor に設定する"""
+def _set_evaluations(actors, outputs):
+    """推論結果を各 Actor に設定する
+
+    outputs は (logits, value) か、残り手数ヘッドがあれば (logits, value, moves_left)
+    """
     # GPU から CPU へはバッチ単位でまとめて転送する
-    logits = logits.float().cpu().numpy()
-    values = value.float().cpu().numpy().reshape(-1)
+    logits = outputs[0].float().cpu().numpy()
+    values = outputs[1].float().cpu().numpy().reshape(-1)
+    moves_left = None
+    if len(outputs) == 3:
+        moves_left = outputs[2].float().cpu().numpy().reshape(-1)
 
     for i, actor in enumerate(actors):
         actor.step.prior_logits = _mask_invalid_actions(
             logits[i], _get_invalid_actions(actor.board)
         )
         actor.step.value = values[i]
+        actor.step.moves_left = None if moves_left is None else moves_left[i]
 
 
 def write_training_data(
@@ -385,28 +400,44 @@ def write_training_data(
             stats_dict[f"{source}/draws"] = stats[DRAW]
 
 
-def _value_scale_type(value):
-    """argparse type of value_scale: a finite number of 0 or more.
+def _bounded_float_type(
+    name,
+    minimum,
+    maximum=math.inf,
+    *,
+    include_minimum=True,
+    include_maximum=True,
+):
+    """Returns an argparse type of a finite number in the range."""
+    range_text = (
+        ("[" if include_minimum else "(")
+        + f"{minimum}, {maximum}"
+        + ("]" if include_maximum and math.isfinite(maximum) else ")")
+    )
 
-    A negative value reverses the order of the Q-values, and NaN breaks the search.
-    0 uses only the prior policy, for comparison.
-    """
-    try:
-        scale = float(value)
-    except ValueError:
-        scale = math.nan
-    if not (math.isfinite(scale) and scale >= 0):
-        raise argparse.ArgumentTypeError(
-            f"value_scale must be a finite number of 0 or more: {value!r}"
-        )
-    return scale
+    def parse(value):
+        try:
+            number = float(value)
+        except ValueError:
+            number = math.nan
+        above = number >= minimum if include_minimum else number > minimum
+        below = number <= maximum if include_maximum else number < maximum
+        if not (math.isfinite(number) and above and below):
+            raise argparse.ArgumentTypeError(
+                f"{name} must be a finite number in {range_text}: {value!r}"
+            )
+        return number
+
+    return parse
 
 
 def add_qtransform_arguments(parser):
     """Adds the arguments of the Q-value transformation of the search."""
     parser.add_argument(
         "--value_scale",
-        type=_value_scale_type,
+        # A negative value reverses the order of the Q-values, and NaN breaks the
+        # search. 0 uses only the prior policy, for comparison.
+        type=_bounded_float_type("value_scale", 0),
         default=0.1,
         help="c_scale of the Q-values in the search, 0 or more. The default is the "
         "same as mctx (the paper uses 0.1 on Atari and 1.0 on Go and chess).",
@@ -419,16 +450,88 @@ def add_qtransform_arguments(parser):
     )
 
 
-def make_qtransform(value_scale: float, rescale_values: bool) -> base.QTransform:
+def make_qtransform(
+    value_scale: float,
+    rescale_values: bool,
+    *,
+    moves_left_beta: float = 0.0,
+    moves_left_tau: float = 20.0,
+    moves_left_threshold: float = 0.6,
+) -> base.QTransform:
     """Returns the Q-value transformation of the search with the settings.
 
-    It is used at the root, at the non-root nodes and for the training targets.
+    With moves_left_beta > 0, the bonus by the moves left is added to it (see
+    qtransform_with_moves_left), which needs a model with the moves-left head.
+    With 0, it is the same as without the moves-left head.
     """
-    return functools.partial(
+    qtransform = functools.partial(
         qtransform_completed_by_mix_value,
         value_scale=value_scale,
         rescale_values=rescale_values,
     )
+    if moves_left_beta == 0:
+        return qtransform
+    return functools.partial(
+        qtransform_with_moves_left,
+        qtransform=qtransform,
+        beta=moves_left_beta,
+        tau=moves_left_tau,
+        threshold=moves_left_threshold,
+    )
+
+
+def make_qtransforms(args):
+    """Returns the Q-value transformations of the search and of the training targets.
+
+    The targets use the moves-left bonus only with --moves_left_target.
+    """
+    qtransform = make_qtransform(
+        args.value_scale,
+        args.rescale_values,
+        moves_left_beta=args.moves_left_beta,
+        moves_left_tau=args.moves_left_tau,
+        moves_left_threshold=args.moves_left_threshold,
+    )
+    # The same object lets the policy reuse the values for the targets
+    if args.moves_left_beta == 0 or args.moves_left_target:
+        return qtransform, qtransform
+    return qtransform, make_qtransform(args.value_scale, args.rescale_values)
+
+
+def add_moves_left_search_arguments(parser):
+    """Adds the arguments of the moves-left bonus of the search."""
+    parser.add_argument(
+        "--moves_left_beta",
+        type=_bounded_float_type("moves_left_beta", 0),
+        default=0.0,
+        help="Maximum of the moves-left bonus in the search (logits), 0 or more. "
+        "0 disables it. It needs a model with the moves-left head.",
+    )
+    parser.add_argument(
+        "--moves_left_tau",
+        type=_bounded_float_type("moves_left_tau", 0, include_minimum=False),
+        default=20.0,
+        help="Difference of the moves left (plies) for the maximum bonus",
+    )
+    parser.add_argument(
+        "--moves_left_threshold",
+        type=_bounded_float_type("moves_left_threshold", 0, 1, include_maximum=False),
+        default=0.6,
+        help="Advantage |2V - 1| from which the moves-left bonus is applied, in [0, 1)",
+    )
+    parser.add_argument(
+        "--moves_left_target",
+        action="store_true",
+        help="Also use the moves-left bonus for the training targets",
+    )
+
+
+def model_has_moves_left(model_path):
+    """Whether the TorchScript model has the moves-left head (by its settings)."""
+    model_settings = read_model_settings(model_path)
+    if model_settings is not None:
+        return model_settings["moves_left"]
+    return _has_moves_left_parameters(load_torchscript_state_dict(model_path))
 
 
 def _check_compile(
@@ -507,6 +610,7 @@ def selfplay(
     qtransform=qtransform_completed_by_mix_value,
     roots=None,
     roots_ratio=1.0,
+    target_qtransform=None,
 ):
     set_nyugyoku_features(use_nyugyoku_features)
     if roots is not None:
@@ -535,9 +639,10 @@ def selfplay(
             max_num_considered_actions,
             num_simulations,
             queue,
-            debug,
-            qtransform,
-            start_positions,
+            debug=debug,
+            qtransform=qtransform,
+            start_positions=start_positions,
+            target_qtransform=target_qtransform,
         )
         for _ in range(batch_size)
     ]
@@ -550,12 +655,10 @@ def selfplay(
 
             # Evaluate
             with torch.no_grad(), autocast(device.type, enabled=amp):
-                # A model with the moves-left head also returns the moves left,
-                # which the search does not use yet
+                # A model with the moves-left head also returns the moves left
                 outputs = model(x1.to(device), x2.to(device))
-                logits, value = outputs[0], outputs[1]
 
-            _set_evaluations(actors, logits, value)
+            _set_evaluations(actors, outputs)
     except KeyboardInterrupt:
         queue.put(None)
         writer_thread.join()
@@ -577,6 +680,7 @@ def selfplay_worker_mp(
     qtransform,
     roots,
     roots_ratio,
+    target_qtransform,
 ):
     """マルチプロセス用の自己対局ワーカー"""
     # 特徴量の設定はプロセス単位なので、ワーカーごとに設定する
@@ -595,9 +699,10 @@ def selfplay_worker_mp(
             max_num_considered_actions,
             num_simulations,
             queue,
-            debug,
-            qtransform,
-            start_positions,
+            debug=debug,
+            qtransform=qtransform,
+            start_positions=start_positions,
+            target_qtransform=target_qtransform,
         )
         for _ in range(batch_size)
     ]
@@ -609,11 +714,10 @@ def selfplay_worker_mp(
 
         # Evaluate with lock
         with lock, torch.no_grad(), autocast(device.type, enabled=amp):
-            # The moves left of a model with the head is not used yet
+            # A model with the moves-left head also returns the moves left
             outputs = model(x1.to(device), x2.to(device))
-            logits, value = outputs[0], outputs[1]
 
-        _set_evaluations(actors, logits, value)
+        _set_evaluations(actors, outputs)
 
 
 def selfplay_multiprocess(
@@ -633,6 +737,7 @@ def selfplay_multiprocess(
     qtransform=qtransform_completed_by_mix_value,
     roots=None,
     roots_ratio=1.0,
+    target_qtransform=None,
 ):
     """マルチプロセスで自己対局を実行する"""
     import multiprocessing as mp
@@ -683,6 +788,7 @@ def selfplay_multiprocess(
                 qtransform,
                 roots,
                 roots_ratio,
+                target_qtransform,
             ),
             daemon=True,
         )
@@ -758,8 +864,15 @@ if __name__ == "__main__":
     )
     add_compile_arguments(parser)
     add_qtransform_arguments(parser)
+    add_moves_left_search_arguments(parser)
     add_start_positions_arguments(parser)
     args = parser.parse_args()
+    if args.moves_left_beta > 0 and not model_has_moves_left(args.model_path):
+        parser.error(
+            f"--moves_left_beta needs a model with the moves-left head: "
+            f"{args.model_path}"
+        )
+    qtransform, target_qtransform = make_qtransforms(args)
     if args.roots is not None:
         try:
             check_roots_file(args.roots)
@@ -786,7 +899,8 @@ if __name__ == "__main__":
             use_nyugyoku_features=args.use_nyugyoku_features,
             compile_options=compile_options,
             network=args.network,
-            qtransform=make_qtransform(args.value_scale, args.rescale_values),
+            qtransform=qtransform,
+            target_qtransform=target_qtransform,
             roots=args.roots,
             roots_ratio=args.roots_ratio,
         )
@@ -804,7 +918,8 @@ if __name__ == "__main__":
             use_nyugyoku_features=args.use_nyugyoku_features,
             compile_options=compile_options,
             network=args.network,
-            qtransform=make_qtransform(args.value_scale, args.rescale_values),
+            qtransform=qtransform,
+            target_qtransform=target_qtransform,
             roots=args.roots,
             roots_ratio=args.roots_ratio,
         )

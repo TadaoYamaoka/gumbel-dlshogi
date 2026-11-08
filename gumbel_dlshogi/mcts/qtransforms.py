@@ -1,5 +1,6 @@
 import numpy as np
 
+from gumbel_dlshogi.mcts import base
 from gumbel_dlshogi.mcts.tree import Tree
 
 
@@ -105,3 +106,58 @@ def _compute_mixed_value(raw_value, qvalues, visit_counts, prior_probs):
     visited_probs = np.maximum(np.finfo(prior_probs.dtype).tiny, prior_probs[visited])
     weighted_q = np.sum(visited_probs * qvalues[visited]) / np.sum(visited_probs)
     return (raw_value + sum_visit_counts * weighted_q) / (sum_visit_counts + 1)
+
+
+def qtransform_with_moves_left(
+    tree: Tree,
+    node_index: int,
+    *,
+    qtransform: base.QTransform,
+    beta: float,
+    tau: float,
+    threshold: float,
+):
+    """Returns the transformed Q-values plus a bonus by the moves left.
+
+    It prefers the shorter wins and the longer losses. The bonus is added after
+    `qtransform` (after the rescaling and the scaling), in the units of the logits,
+    so that its effect does not depend on the range of the Q-values of the node.
+    All the values are from the side to move at the node:
+
+      v = 2 V - 1 (V: the value of the node), s = sign(v)
+      w = clip((|v| - threshold) / (1 - threshold), 0, 1)
+      bonus(a) = beta * s * w * clip((M_node - 1 - M_child(a)) / tau, -1, 1)
+
+    only for the visited actions on the same side as the node, s (2 Q(a) - 1) >
+    threshold, and 0 for the others (so 0 for a draw with Q = 0.5). M_node - 1 is
+    the expected moves left of the children (in plies). The bonus is at most beta,
+    and it does not change the values of the tree. This is not in mctx.
+
+    Args:
+      qtransform: the Q-value transformation to add the bonus to.
+      beta: the maximum of the bonus.
+      tau: the difference of the moves left (plies) for the maximum bonus.
+      threshold: the advantage |2 V - 1| from which the bonus is applied.
+    """
+    qvalues = qtransform(tree, node_index)
+    centered_value = 2 * float(tree.node_values[node_index]) - 1
+    if abs(centered_value) <= threshold:
+        return qvalues
+
+    direction = np.sign(centered_value)
+    weight = min((abs(centered_value) - threshold) / (1 - threshold), 1.0)
+    eligible = np.flatnonzero(
+        (tree.children_visits[node_index] > 0)
+        & (direction * (2 * tree.qvalues(node_index) - 1) > threshold)
+    )
+    if len(eligible) == 0:
+        return qvalues
+
+    # Read the children only for the eligible (visited) actions
+    children = tree.children_index[node_index, eligible]
+    children_moves_left = tree.node_moves_left[children]
+    expected_moves_left = tree.node_moves_left[node_index] - 1
+    difference = np.clip((expected_moves_left - children_moves_left) / tau, -1, 1)
+    qvalues = qvalues.copy()
+    qvalues[eligible] += beta * direction * weight * difference
+    return qvalues

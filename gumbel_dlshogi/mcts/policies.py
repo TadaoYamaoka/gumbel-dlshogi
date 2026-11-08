@@ -15,6 +15,7 @@ def gumbel_muzero_policy(
     max_num_considered_actions: int = 16,
     gumbel_scale: float = 1.0,
     qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value,
+    target_qtransform: Optional[base.QTransform] = None,
 ):
     """Runs Gumbel MuZero search and returns the `PolicyOutput`.
 
@@ -43,7 +44,11 @@ def gumbel_muzero_policy(
       gumbel_scale: scale for the Gumbel noise. Evalution on perfect-information
         games can use gumbel_scale=0.0.
       qtransform: function to obtain the completed and scaled Q-values for a node,
-        used at the root, at the non-root nodes and for the action weights.
+        used at the root, at the non-root nodes and for the final action.
+      target_qtransform: the function for the action weights (the training
+        targets). None uses `qtransform`. Even with another function (e.g. without
+        the moves-left bonus), `qtransform` affects the targets indirectly, since it
+        changes the visits and so the Q-values.
 
     Returns:
       `PolicyOutput` containing the proposed action and action_weights.
@@ -88,9 +93,14 @@ def gumbel_muzero_policy(
     )
     action = action_selection.masked_argmax(to_argmax, invalid_actions)
 
-    # Producing action_weights usable to train the policy network.
+    # Producing action_weights usable to train the policy network. They are from
+    # target_qtransform, without changing the values used for the action above.
+    if target_qtransform is None or target_qtransform is qtransform:
+        target_qvalues = completed_qvalues
+    else:
+        target_qvalues = target_qtransform(tree, tree.ROOT_INDEX)
     completed_search_logits = _mask_invalid_actions(
-        root.prior_logits + completed_qvalues, invalid_actions
+        root.prior_logits + target_qvalues, invalid_actions
     )
     action_weights = softmax(completed_search_logits)
     return base.PolicyOutput(action=action, action_weights=action_weights)

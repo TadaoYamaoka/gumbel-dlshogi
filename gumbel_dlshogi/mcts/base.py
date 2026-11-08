@@ -14,10 +14,13 @@ class EvaluationStep:
     prior_logits: `[num_actions]` the logits produced by a policy network, with
       the illegal moves masked. None for a terminal position.
     value: `[]` the win rate of the side to move.
+    moves_left: `[]` the number of plies until the end of the game, predicted by
+      the moves-left head (0 for a terminal position). None without the head.
     """
 
     prior_logits: Optional[np.ndarray] = None
     value: Optional[np.float32] = None
+    moves_left: Optional[np.float32] = None
 
 
 @dataclass
@@ -26,10 +29,13 @@ class RootFnOutput:
 
     prior_logits: `[num_actions]` the logits produced by a policy network.
     value: `[]` an approximate value of the current state.
+    moves_left: `[]` the number of plies until the end of the game, predicted by
+      the moves-left head. None without the head.
     """
 
     prior_logits: np.ndarray
     value: np.float32
+    moves_left: Optional[np.float32] = None
 
 
 @dataclass
