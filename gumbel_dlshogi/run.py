@@ -24,6 +24,10 @@ from gumbel_dlshogi.selfplay import (
     make_qtransform,
     selfplay_multiprocess,
 )
+from gumbel_dlshogi.start_positions import (
+    add_start_positions_arguments,
+    check_roots_file,
+)
 from gumbel_dlshogi.train import add_gpus_argument, train
 
 
@@ -196,6 +200,7 @@ def main():
     parser.add_argument("--num_processes", type=int, default=4)
     parser.add_argument("--skip_max_moves", action="store_true")
     add_qtransform_arguments(parser)
+    add_start_positions_arguments(parser)
 
     # Training arguments
     parser.add_argument("--train_epochs", type=int, default=1)
@@ -243,6 +248,11 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.roots is not None:
+        try:
+            check_roots_file(args.roots)
+        except ValueError as e:
+            parser.error(str(e))
     if args.train_epochs < 1:
         parser.error("--train_epochs must be at least 1.")
     compile_options = {"backend": args.compile_backend, "mode": args.compile_mode}
@@ -407,6 +417,8 @@ def main():
             compile_options=compile_options if args.selfplay_compile else None,
             network=args.network,
             qtransform=make_qtransform(args.value_scale, args.rescale_values),
+            roots=args.roots,
+            roots_ratio=args.roots_ratio,
         )
 
         # Log self-play stats to TensorBoard
@@ -429,6 +441,11 @@ def main():
             writer.add_scalar(
                 "parameters/selfplay/rescale_values",
                 int(args.rescale_values),
+                current_cycle_num,
+            )
+            writer.add_scalar(
+                "parameters/selfplay/roots_ratio",
+                args.roots_ratio if args.roots is not None else 0.0,
                 current_cycle_num,
             )
             writer.add_scalar(

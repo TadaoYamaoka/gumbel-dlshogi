@@ -49,6 +49,13 @@ from gumbel_dlshogi.mcts.base import EvaluationStep, RootFnOutput
 from gumbel_dlshogi.mcts.policies import _mask_invalid_actions, gumbel_muzero_policy
 from gumbel_dlshogi.mcts.qtransforms import qtransform_completed_by_mix_value
 from gumbel_dlshogi.mcts.search import MAX_MOVES
+from gumbel_dlshogi.start_positions import (
+    SOURCES,
+    STARTPOS,
+    StartPositions,
+    add_start_positions_arguments,
+    check_roots_file,
+)
 from gumbel_dlshogi.network import (
     PolicyValueNetworkAddSigmoid,
     add_compile_arguments,
@@ -70,6 +77,7 @@ class TrainingData:
     is_nyugyoku: bool
     is_draw: int
     is_max_moves: bool
+    source: str  # Source of the start position (STARTPOS or ROOTS)
 
 
 def _get_invalid_actions(board: Board) -> np.ndarray:
@@ -91,11 +99,16 @@ class Actor:
         queue: Queue,
         debug=False,
         qtransform=qtransform_completed_by_mix_value,
+        start_positions=None,
     ):
         self.board = Board()
         self.max_num_considered_actions = max_num_considered_actions
         self.num_simulations = num_simulations
         self.qtransform = qtransform
+        self.start_positions = (
+            StartPositions() if start_positions is None else start_positions
+        )
+        # The first game starts at the first call of next()
         self.step = None
         self.generator = None
         self.queue = queue
@@ -104,9 +117,21 @@ class Actor:
         self.hcps = np.empty(MAX_MOVES, dtype=HuffmanCodedPos)
         self.policy_outputs = []
 
+    def _start_game(self):
+        """Starts a new game, waiting for the evaluation of the start position.
+
+        The caller evaluates the position of board and sets the result to step
+        before the next call of next(), which starts the search.
+        """
+        self.source = self.start_positions.set_start_position(self.board)
+        self.start_sfen = self.board.sfen()
+        self.step = EvaluationStep()
+        self.generator = None
+        self.policy_outputs = []
+
     def next(self):
         if self.step is None:
-            self.step = EvaluationStep()
+            self._start_game()
             return
 
         if self.generator is None:
@@ -158,9 +183,14 @@ class Actor:
                 or (is_mate_in_3ply := self.board.mate_move(3) != 0)
             ):
                 if self.debug:
-                    print(
-                        f"startpos moves {' '.join(move_to_usi(move) for move in self.board.history)}"
+                    # The history starts from the start position
+                    position = (
+                        "startpos"
+                        if self.source == STARTPOS
+                        else f"sfen {self.start_sfen}"
                     )
+                    moves = " ".join(move_to_usi(move) for move in self.board.history)
+                    print(f"{position} moves {moves}")
                 self.queue.put(
                     TrainingData(
                         hcps=self.hcps[: len(self.policy_outputs)].copy(),
@@ -171,11 +201,11 @@ class Actor:
                         is_nyugyoku=is_nyugyoku,
                         is_draw=is_draw,
                         is_max_moves=is_max_moves,
+                        source=self.source,
                     )
                 )
 
-                self.board.reset()
-                self.policy_outputs = []
+                self._start_game()
 
 
 def _allocate_input_buffers(batch_size):
@@ -230,6 +260,11 @@ def write_training_data(
     max_moves_count = 0
     total_moves = 0
     total_games = 0
+    # Games, positions and results of each source of the start position
+    source_stats = {
+        source: {"games": 0, "positions": 0, BLACK_WIN: 0, WHITE_WIN: 0, DRAW: 0}
+        for source in SOURCES
+    }
 
     with tqdm(total=num_positions, unit="pos") as pbar:
         while pbar.n < num_positions:
@@ -283,6 +318,10 @@ def write_training_data(
 
             total_moves += len(training_data.policy_outputs)
             total_games += 1
+            stats = source_stats[training_data.source]
+            stats["games"] += 1
+            stats["positions"] += len(training_data.policy_outputs)
+            stats[result] += 1
 
             pbar.update(len(training_data.policy_outputs))
             pbar.set_postfix(
@@ -305,6 +344,16 @@ def write_training_data(
         stats_dict["nyugyoku_count"] = nyugyoku_count
         stats_dict["draw_count"] = draw_count
         stats_dict["max_moves_count"] = max_moves_count
+        for source, stats in source_stats.items():
+            games = stats["games"]
+            stats_dict[f"{source}/games"] = games
+            stats_dict[f"{source}/positions"] = stats["positions"]
+            stats_dict[f"{source}/average_moves"] = (
+                stats["positions"] / games if games > 0 else 0
+            )
+            stats_dict[f"{source}/black_wins"] = stats[BLACK_WIN]
+            stats_dict[f"{source}/white_wins"] = stats[WHITE_WIN]
+            stats_dict[f"{source}/draws"] = stats[DRAW]
 
 
 def _value_scale_type(value):
@@ -416,8 +465,12 @@ def selfplay(
     compile_options=None,
     network=None,
     qtransform=qtransform_completed_by_mix_value,
+    roots=None,
+    roots_ratio=1.0,
 ):
     set_nyugyoku_features(use_nyugyoku_features)
+    if roots is not None:
+        check_roots_file(roots)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if compile_options is not None:
@@ -425,6 +478,7 @@ def selfplay(
             model_path, device, compile_options, network, use_nyugyoku_features
         )
     model = _load_model(model_path, device, compile_options, network)
+    start_positions = StartPositions(roots, roots_ratio)
 
     init_table(max_num_considered_actions, num_simulations)
 
@@ -437,7 +491,14 @@ def selfplay(
     writer_thread.start()
 
     actors = [
-        Actor(max_num_considered_actions, num_simulations, queue, debug, qtransform)
+        Actor(
+            max_num_considered_actions,
+            num_simulations,
+            queue,
+            debug,
+            qtransform,
+            start_positions,
+        )
         for _ in range(batch_size)
     ]
 
@@ -471,6 +532,8 @@ def selfplay_worker_mp(
     compile_options,
     network,
     qtransform,
+    roots,
+    roots_ratio,
 ):
     """マルチプロセス用の自己対局ワーカー"""
     # 特徴量の設定はプロセス単位なので、ワーカーごとに設定する
@@ -481,9 +544,18 @@ def selfplay_worker_mp(
         model = _load_model(model_path, device, compile_options, network)
 
     init_table(max_num_considered_actions, num_simulations)
+    # The file is opened in each process, which shares its pages with the others
+    start_positions = StartPositions(roots, roots_ratio)
 
     actors = [
-        Actor(max_num_considered_actions, num_simulations, queue, debug, qtransform)
+        Actor(
+            max_num_considered_actions,
+            num_simulations,
+            queue,
+            debug,
+            qtransform,
+            start_positions,
+        )
         for _ in range(batch_size)
     ]
 
@@ -514,11 +586,15 @@ def selfplay_multiprocess(
     compile_options=None,
     network=None,
     qtransform=qtransform_completed_by_mix_value,
+    roots=None,
+    roots_ratio=1.0,
 ):
     """マルチプロセスで自己対局を実行する"""
     import multiprocessing as mp
 
     # Check the options here, since an error in the workers does not stop the writer
+    if roots is not None:
+        check_roots_file(roots)
     if compile_options is not None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         network = _check_compile(
@@ -560,6 +636,8 @@ def selfplay_multiprocess(
                 compile_options,
                 network,
                 qtransform,
+                roots,
+                roots_ratio,
             ),
             daemon=True,
         )
@@ -635,7 +713,13 @@ if __name__ == "__main__":
     )
     add_compile_arguments(parser)
     add_qtransform_arguments(parser)
+    add_start_positions_arguments(parser)
     args = parser.parse_args()
+    if args.roots is not None:
+        try:
+            check_roots_file(args.roots)
+        except ValueError as e:
+            parser.error(str(e))
     compile_options = (
         {"backend": args.compile_backend, "mode": args.compile_mode}
         if args.compile
@@ -658,6 +742,8 @@ if __name__ == "__main__":
             compile_options=compile_options,
             network=args.network,
             qtransform=make_qtransform(args.value_scale, args.rescale_values),
+            roots=args.roots,
+            roots_ratio=args.roots_ratio,
         )
     else:
         selfplay(
@@ -674,4 +760,6 @@ if __name__ == "__main__":
             compile_options=compile_options,
             network=args.network,
             qtransform=make_qtransform(args.value_scale, args.rescale_values),
+            roots=args.roots,
+            roots_ratio=args.roots_ratio,
         )
