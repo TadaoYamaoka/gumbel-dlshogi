@@ -20,6 +20,8 @@ import os
 import numpy as np
 from cshogi import Board, HuffmanCodedPos
 
+from gumbel_dlshogi.game import end_reason
+
 # Sources of the start position of a game
 STARTPOS = "startpos"
 ROOTS = "roots"
@@ -90,7 +92,7 @@ def _has_valid_king_squares(record):
 
 def _is_terminal(board):
     """Whether the game would end at once (the same rules as the self-play games)."""
-    return board.is_game_over() or board.is_nyugyoku() or board.mate_move(3) != 0
+    return end_reason(board) is not None
 
 
 class StartPositions:

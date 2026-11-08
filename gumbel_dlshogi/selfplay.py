@@ -1,22 +1,17 @@
 import argparse
 import functools
-import math
 import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from queue import Queue
+from typing import Optional
 
 import numpy as np
 import torch
 from cshogi import (
-    BLACK,
     BLACK_WIN,
     DRAW,
-    NOT_REPETITION,
-    REPETITION_DRAW,
-    REPETITION_LOSE,
-    REPETITION_WIN,
     WHITE_WIN,
     Board,
     HuffmanCodedPos,
@@ -44,6 +39,7 @@ from gumbel_dlshogi.features import (
     make_move_label,
     set_nyugyoku_features,
 )
+from gumbel_dlshogi.game import END_REASONS, MAX_MOVES, end_reason, game_result
 from gumbel_dlshogi.initial_model import (
     check_torchscript_model,
     read_model_settings,
@@ -56,7 +52,6 @@ from gumbel_dlshogi.mcts.qtransforms import (
     qtransform_completed_by_mix_value,
     qtransform_with_moves_left,
 )
-from gumbel_dlshogi.mcts.search import MAX_MOVES
 from gumbel_dlshogi.network.moves_left import MOVES_LEFT_PREFIX
 from gumbel_dlshogi.start_positions import (
     SOURCES,
@@ -80,43 +75,9 @@ from gumbel_dlshogi.network import (
 class TrainingData:
     hcps: np.ndarray
     policy_outputs: list[base.PolicyOutput]
-    turn: int
-    is_mate_in_3ply: bool
-    is_game_over: bool
-    is_nyugyoku: bool
-    is_draw: int
-    is_max_moves: bool
+    turn: int  # The side to move at the end
+    end_reason: str  # How the game ended (one of game.END_REASONS)
     source: str  # Source of the start position (STARTPOS or ROOTS)
-
-
-# How a self-play game ends, in the order of the checks of Actor (only the first
-# condition that holds is set in TrainingData)
-END_REASONS = (
-    "checkmate",  # the side to move has no legal moves
-    "nyugyoku",  # the side to move can declare (入玉宣言)
-    "repetition_draw",  # 千日手
-    "repetition_win",  # 連続王手の千日手で手番側の勝ち
-    "repetition_lose",  # 連続王手の千日手で手番側の負け
-    "max_moves",
-    "mate_in_3ply",  # the side to move has a mate in 3 plies (the game is ended)
-)
-
-
-def _end_reason(training_data):
-    """Returns how the game of the training data ended (one of END_REASONS)."""
-    if training_data.is_game_over:
-        return "checkmate"
-    if training_data.is_nyugyoku:
-        return "nyugyoku"
-    if training_data.is_draw == REPETITION_DRAW:
-        return "repetition_draw"
-    if training_data.is_draw == REPETITION_WIN:
-        return "repetition_win"
-    if training_data.is_draw == REPETITION_LOSE:
-        return "repetition_lose"
-    if training_data.is_max_moves:
-        return "max_moves"
-    return "mate_in_3ply"
 
 
 def _get_invalid_actions(board: Board) -> np.ndarray:
@@ -130,7 +91,86 @@ def _get_invalid_actions(board: Board) -> np.ndarray:
     return invalid_actions
 
 
+def move_from_label(board: Board, label) -> int:
+    """Returns the legal move of the position with the move label."""
+    move = next(
+        (
+            move
+            for move in board.legal_moves
+            if make_move_label(move, board.turn) == label
+        ),
+        None,
+    )
+    assert move is not None
+    return move
+
+
+class MoveSearch:
+    """Searches a move from the position of a board, evaluated by the caller.
+
+    After reset() (and when a search ends), step waits for the evaluation of the
+    position of the board: the caller sets it (prior_logits, value and moves_left)
+    before calling next(), which starts the search. While searching, the board is
+    at the leaf to evaluate after each call of next(), and step waits for its
+    evaluation in the same way.
+    """
+
+    def __init__(
+        self,
+        board: Board,
+        max_num_considered_actions,
+        num_simulations,
+        qtransform=qtransform_completed_by_mix_value,
+        target_qtransform=None,
+        gumbel_scale=1.0,
+    ):
+        self.board = board
+        self.max_num_considered_actions = max_num_considered_actions
+        self.num_simulations = num_simulations
+        self.qtransform = qtransform
+        self.target_qtransform = target_qtransform
+        self.gumbel_scale = gumbel_scale
+        self.reset()
+
+    def reset(self):
+        """Waits for the evaluation of the position to search a move from."""
+        self.step = EvaluationStep()
+        self.generator = None
+
+    def next(self) -> Optional[base.PolicyOutput]:
+        """Advances the search, and returns the policy output when it ends."""
+        if self.generator is None:
+            root = RootFnOutput(
+                prior_logits=self.step.prior_logits,
+                value=self.step.value,
+                moves_left=self.step.moves_left,
+            )
+            self.generator = gumbel_muzero_policy(
+                self.board,
+                root,
+                self.num_simulations,
+                _get_invalid_actions(self.board),
+                self.max_num_considered_actions,
+                gumbel_scale=self.gumbel_scale,
+                qtransform=self.qtransform,
+                target_qtransform=self.target_qtransform,
+            )
+
+        try:
+            self.step = next(self.generator)
+        except StopIteration as e:
+            self.reset()
+            return e.value
+        return None
+
+
 class Actor:
+    """Plays self-play games: searches the moves, ends the games and records them.
+
+    Like MoveSearch, the caller evaluates the position of board and sets the result
+    to step after each call of next().
+    """
+
     def __init__(
         self,
         max_num_considered_actions,
@@ -142,117 +182,73 @@ class Actor:
         target_qtransform=None,
     ):
         self.board = Board()
-        self.max_num_considered_actions = max_num_considered_actions
-        self.num_simulations = num_simulations
-        self.qtransform = qtransform
-        self.target_qtransform = target_qtransform
+        self.search = MoveSearch(
+            self.board,
+            max_num_considered_actions,
+            num_simulations,
+            qtransform=qtransform,
+            target_qtransform=target_qtransform,
+        )
         self.start_positions = (
             StartPositions() if start_positions is None else start_positions
         )
         # The first game starts at the first call of next()
-        self.step = None
-        self.generator = None
+        self.started = False
         self.queue = queue
         self.debug = debug
 
         self.hcps = np.empty(MAX_MOVES, dtype=HuffmanCodedPos)
         self.policy_outputs = []
 
-    def _start_game(self):
-        """Starts a new game, waiting for the evaluation of the start position.
+    @property
+    def step(self):
+        """The evaluation of the position of board to set"""
+        return self.search.step
 
-        The caller evaluates the position of board and sets the result to step
-        before the next call of next(), which starts the search.
-        """
+    def _start_game(self):
+        """Starts a new game, waiting for the evaluation of the start position."""
         self.source = self.start_positions.set_start_position(self.board)
         self.start_sfen = self.board.sfen()
-        self.step = EvaluationStep()
-        self.generator = None
+        self.search.reset()
         self.policy_outputs = []
 
     def next(self):
-        if self.step is None:
+        if not self.started:
+            self.started = True
             self._start_game()
             return
 
-        if self.generator is None:
-            self.root = RootFnOutput(
-                prior_logits=self.step.prior_logits,
-                value=self.step.value,
-                moves_left=self.step.moves_left,
+        policy_output = self.search.next()
+        if policy_output is None:
+            return
+
+        self.board.to_hcp(np.asarray(self.hcps[len(self.policy_outputs)]))
+        self.policy_outputs.append(policy_output)
+        self.board.push(move_from_label(self.board, policy_output.action))
+
+        reason = end_reason(self.board)
+        if reason is None:
+            return
+        if self.debug:
+            # The history starts from the start position
+            position = (
+                "startpos" if self.source == STARTPOS else f"sfen {self.start_sfen}"
             )
-            invalid_actions = _get_invalid_actions(self.board)
-            self.generator = gumbel_muzero_policy(
-                self.board,
-                self.root,
-                self.num_simulations,
-                invalid_actions,
-                self.max_num_considered_actions,
-                qtransform=self.qtransform,
-                target_qtransform=self.target_qtransform,
+            moves = " ".join(move_to_usi(move) for move in self.board.history)
+            print(f"{position} moves {moves}")
+        self.queue.put(
+            TrainingData(
+                hcps=self.hcps[: len(self.policy_outputs)].copy(),
+                policy_outputs=self.policy_outputs,
+                turn=self.board.turn,
+                end_reason=reason,
+                source=self.source,
             )
-
-        try:
-            self.step = next(self.generator)
-        except StopIteration as e:
-            policy_output = e.value
-
-            self.board.to_hcp(np.asarray(self.hcps[len(self.policy_outputs)]))
-            self.policy_outputs.append(policy_output)
-
-            action = policy_output.action
-            move = next(
-                (
-                    move
-                    for move in self.board.legal_moves
-                    if make_move_label(move, self.board.turn) == action
-                ),
-                None,
-            )
-            assert move is not None
-            self.board.push(move)
-            self.step = EvaluationStep()
-            self.generator = None
-
-            is_nyugyoku = False
-            is_draw = NOT_REPETITION
-            is_max_moves = False
-            is_mate_in_3ply = False
-            if (
-                (is_game_over := self.board.is_game_over())
-                or (is_nyugyoku := self.board.is_nyugyoku())
-                or (is_draw := self.board.is_draw())
-                in (REPETITION_DRAW, REPETITION_WIN, REPETITION_LOSE)
-                or (is_max_moves := self.board.move_number >= MAX_MOVES)
-                or (is_mate_in_3ply := self.board.mate_move(3) != 0)
-            ):
-                if self.debug:
-                    # The history starts from the start position
-                    position = (
-                        "startpos"
-                        if self.source == STARTPOS
-                        else f"sfen {self.start_sfen}"
-                    )
-                    moves = " ".join(move_to_usi(move) for move in self.board.history)
-                    print(f"{position} moves {moves}")
-                self.queue.put(
-                    TrainingData(
-                        hcps=self.hcps[: len(self.policy_outputs)].copy(),
-                        policy_outputs=self.policy_outputs,
-                        turn=self.board.turn,
-                        is_mate_in_3ply=is_mate_in_3ply,
-                        is_game_over=is_game_over,
-                        is_nyugyoku=is_nyugyoku,
-                        is_draw=is_draw,
-                        is_max_moves=is_max_moves,
-                        source=self.source,
-                    )
-                )
-
-                self._start_game()
+        )
+        self._start_game()
 
 
-def _allocate_input_buffers(batch_size):
+def allocate_input_buffers(batch_size):
     """推論用の入力バッファ x1, x2 を確保する"""
     # pin_memory は CUDA がある場合のみ使える
     pin_memory = torch.cuda.is_available()
@@ -273,7 +269,7 @@ def _step_actors(actors, x1, x2):
         make_input_features(actor.board, features1[i], features2[i])
 
 
-def _set_evaluations(actors, outputs):
+def set_evaluations(actors, outputs):
     """推論結果を各 Actor に設定する
 
     outputs は (logits, value) か、残り手数ヘッドがあれば (logits, value, moves_left)
@@ -337,37 +333,23 @@ def write_training_data(
             if training_data is None:
                 break
 
-            if (
-                training_data.is_mate_in_3ply
-                or training_data.is_nyugyoku
-                or training_data.is_draw == REPETITION_WIN
-            ):
-                if training_data.turn == BLACK:
-                    result = BLACK_WIN
-                else:
-                    result = WHITE_WIN
-                if training_data.is_nyugyoku:
-                    nyugyoku_count += 1
-            elif training_data.is_game_over or training_data.is_draw == REPETITION_LOSE:
-                if training_data.turn == BLACK:
-                    result = WHITE_WIN
-                else:
-                    result = BLACK_WIN
-            else:
-                result = DRAW
-                if training_data.is_draw == REPETITION_DRAW:
-                    draw_count += 1
-                else:  # max_moves
-                    max_moves_count += 1
-                    if skip_max_moves:
-                        continue
+            reason = training_data.end_reason
+            result = game_result(reason, training_data.turn)
+            if reason == "nyugyoku":
+                nyugyoku_count += 1
+            elif reason == "repetition_draw":
+                draw_count += 1
+            elif reason == "max_moves":
+                max_moves_count += 1
+                if skip_max_moves:
+                    continue
 
             num_positions_in_game = len(training_data.policy_outputs)
             positions = np.empty(num_positions_in_game, dtype=dtypePosition)
             positions["hcp"] = training_data.hcps
             positions["result"] = result
             # Plies until the end of the game: T - t for the position s_t
-            if training_data.is_max_moves:
+            if reason == "max_moves":
                 moves_left = np.full(
                     num_positions_in_game, MOVES_LEFT_INVALID, dtype=dtypeMovesLeft
                 )
@@ -399,7 +381,7 @@ def write_training_data(
             stats["games"] += 1
             stats["positions"] += len(training_data.policy_outputs)
             stats[result] += 1
-            stats = end_stats[training_data.source, _end_reason(training_data)]
+            stats = end_stats[training_data.source, reason]
             stats["games"] += 1
             stats["positions"] += len(training_data.policy_outputs)
 
@@ -587,7 +569,7 @@ def _has_moves_left_parameters(state_dict):
     return any(key.startswith(MOVES_LEFT_PREFIX) for key in state_dict)
 
 
-def _load_model(model_path, device, compile_options, network):
+def load_model(model_path, device, compile_options, network):
     """Loads the TorchScript model for inference, or compiles it with torch.compile.
 
     torch.compile does not compile TorchScript, so the network given by its name
@@ -639,7 +621,7 @@ def selfplay(
         network = _check_compile(
             model_path, device, compile_options, network, use_nyugyoku_features
         )
-    model = _load_model(model_path, device, compile_options, network)
+    model = load_model(model_path, device, compile_options, network)
     start_positions = StartPositions(roots, roots_ratio)
 
     init_table(max_num_considered_actions, num_simulations)
@@ -665,7 +647,7 @@ def selfplay(
         for _ in range(batch_size)
     ]
 
-    x1, x2 = _allocate_input_buffers(batch_size)
+    x1, x2 = allocate_input_buffers(batch_size)
 
     try:
         while writer_thread.is_alive():
@@ -676,7 +658,7 @@ def selfplay(
                 # A model with the moves-left head also returns the moves left
                 outputs = model(x1.to(device), x2.to(device))
 
-            _set_evaluations(actors, outputs)
+            set_evaluations(actors, outputs)
     except KeyboardInterrupt:
         queue.put(None)
         writer_thread.join()
@@ -706,7 +688,7 @@ def selfplay_worker_mp(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with lock:
-        model = _load_model(model_path, device, compile_options, network)
+        model = load_model(model_path, device, compile_options, network)
 
     init_table(max_num_considered_actions, num_simulations)
     # The file is opened in each process, which shares its pages with the others
@@ -725,7 +707,7 @@ def selfplay_worker_mp(
         for _ in range(batch_size)
     ]
 
-    x1, x2 = _allocate_input_buffers(batch_size)
+    x1, x2 = allocate_input_buffers(batch_size)
 
     while not stop_event.is_set():
         _step_actors(actors, x1, x2)
@@ -735,7 +717,7 @@ def selfplay_worker_mp(
             # A model with the moves-left head also returns the moves left
             outputs = model(x1.to(device), x2.to(device))
 
-        _set_evaluations(actors, outputs)
+        set_evaluations(actors, outputs)
 
 
 def selfplay_multiprocess(

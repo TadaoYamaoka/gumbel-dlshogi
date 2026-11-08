@@ -1,9 +1,10 @@
 from typing import Any, NamedTuple, Optional, Tuple
 
 import numpy as np
-from cshogi import REPETITION_DRAW, REPETITION_LOSE, REPETITION_WIN, Board
+from cshogi import Board
 
 from gumbel_dlshogi.features import make_move_label
+from gumbel_dlshogi.game import END_REASONS, end_reason
 from gumbel_dlshogi.mcts import base
 from gumbel_dlshogi.mcts.action_selection import (
     gumbel_muzero_interior_action_selection,
@@ -12,7 +13,6 @@ from gumbel_dlshogi.mcts.action_selection import (
 from gumbel_dlshogi.mcts.qtransforms import qtransform_completed_by_mix_value, softmax
 from gumbel_dlshogi.mcts.tree import Tree
 
-MAX_MOVES = 512
 
 
 def search(
@@ -87,22 +87,10 @@ class _SimulationState(NamedTuple):
 
 def get_terminal_value(board: Board) -> Optional[np.float32]:
     """Returns the game result from the side to move, or None if not terminal."""
-    if board.is_game_over():
-        return np.float32(0.0)
-    if board.is_nyugyoku():
-        return np.float32(1.0)
-    draw = board.is_draw()
-    if draw == REPETITION_DRAW:
-        return np.float32(0.5)
-    if draw == REPETITION_WIN:
-        return np.float32(1.0)
-    if draw == REPETITION_LOSE:
-        return np.float32(0.0)
-    if board.move_number >= MAX_MOVES:
-        return np.float32(0.5)
-    if board.mate_move(3) != 0:
-        return np.float32(1.0)
-    return None
+    reason = end_reason(board)
+    if reason is None:
+        return None
+    return np.float32(END_REASONS[reason])
 
 
 def simulate(
