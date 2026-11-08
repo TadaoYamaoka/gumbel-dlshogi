@@ -3,7 +3,7 @@ from typing import Optional
 
 import numpy as np
 
-from gumbel_dlshogi.mcts import qtransforms, seq_halving
+from gumbel_dlshogi.mcts import base, qtransforms, seq_halving
 from gumbel_dlshogi.mcts.qtransforms import softmax
 from gumbel_dlshogi.mcts.tree import Tree
 
@@ -25,11 +25,15 @@ class GumbelMuZeroExtraData:
 
 
 def gumbel_muzero_root_action_selection(
-    tree: Tree, node_index: int, max_num_considered_actions: int
+    tree: Tree,
+    node_index: int,
+    *,
+    max_num_considered_actions: int,
+    qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value,
 ):
     visit_counts = tree.children_visits[node_index]
     prior_logits = tree.children_prior_logits[node_index]
-    completed_qvalues = qtransforms.qtransform_completed_by_mix_value(tree, node_index)
+    completed_qvalues = qtransform(tree, node_index)
 
     num_valid_actions = np.sum(1 - tree.root_invalid_actions).astype(np.int32)
     num_considered = np.minimum(max_num_considered_actions, num_valid_actions)
@@ -48,6 +52,8 @@ def gumbel_muzero_root_action_selection(
 def gumbel_muzero_interior_action_selection(
     tree: Tree,
     node_index: int,
+    *,
+    qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value,
 ) -> np.ndarray:
     """Selects the action with a deterministic action selection.
 
@@ -55,18 +61,17 @@ def gumbel_muzero_interior_action_selection(
     frequencies similar to softmax(prior_logits + qvalues).
 
     Args:
-        rng_key: random number generator state.
         tree: _unbatched_ MCTS tree state.
         node_index: scalar index of the node from which to take an action.
-        depth: the scalar depth of the current node. The root has depth zero.
-        qtransform: function to obtain completed Q-values for a node.
+        qtransform: function to obtain the completed and scaled Q-values for a
+          node.
 
     Returns:
         action: the action selected from the given node.
     """
     visit_counts = tree.children_visits[node_index]
     prior_logits = tree.children_prior_logits[node_index]
-    completed_qvalues = qtransforms.qtransform_completed_by_mix_value(tree, node_index)
+    completed_qvalues = qtransform(tree, node_index)
 
     # The `prior_logits + completed_qvalues` provide an improved policy,
     # because the missing qvalues are replaced by v_{prior_logits}(node).

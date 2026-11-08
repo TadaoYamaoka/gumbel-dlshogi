@@ -9,7 +9,7 @@ from gumbel_dlshogi.mcts.action_selection import (
     gumbel_muzero_interior_action_selection,
     gumbel_muzero_root_action_selection,
 )
-from gumbel_dlshogi.mcts.qtransforms import softmax
+from gumbel_dlshogi.mcts.qtransforms import qtransform_completed_by_mix_value, softmax
 from gumbel_dlshogi.mcts.tree import Tree
 
 MAX_MOVES = 512
@@ -18,39 +18,37 @@ MAX_MOVES = 512
 def search(
     board: Board,
     tree: Tree,
-    root: base.RootFnOutput,
     max_num_considered_actions: int,
     num_simulations: int,
-    invalid_actions: Optional[np.ndarray] = None,
+    qtransform: base.QTransform = qtransform_completed_by_mix_value,
 ):
-    """Performs a full search and returns sampled actions.
+    """Performs a full search, updating the tree in place.
 
-    In the shape descriptions, `B` denotes the batch dimension.
+    Unlike mctx, which calls `recurrent_fn` to evaluate the leaves, this is a
+    generator: it yields an `EvaluationStep` for each leaf to evaluate while
+    `board` is at the leaf, and the caller sets its `prior_logits` and `value`
+    before resuming. Terminal positions are not yielded; they are evaluated by
+    the game result (`get_terminal_value`). There is no `max_depth`: a simulation
+    continues until an unvisited action or a terminal position.
+
+    mctx creates the tree from `root` and `invalid_actions` inside the search.
+    Here the tree is created by the caller (`instantiate_tree_from_root`), which
+    stores the mask of the invalid actions at the root (`root_invalid_actions`).
 
     Args:
-      root: a `(prior_logits, value, embedding)` `RootFnOutput`. The
-        `prior_logits` are from a policy network. The shapes are
-        `([num_actions], [], [...])`, respectively.
+      board: the position of the root. It is moved along the simulations and is
+        back at the root after the search.
+      tree: the tree created by `instantiate_tree_from_root`.
+      max_num_considered_actions: the maximum number of actions considered by
+        Sequential Halving at the root.
       num_simulations: the number of simulations.
-      max_depth: maximum search tree depth allowed during simulation, defined as
-        the number of edges from the root to a leaf node.
-      invalid_actions: a mask with invalid actions at the root. In the
-        mask, invalid actions have ones, and valid actions have zeros.
-        Shape `[num_actions]`.
-      extra_data: extra data passed to `tree.extra_data`. Shape `[...]`.
-
-    Returns:
-      `SearchResults` containing outcomes of the search, e.g. `visit_counts`
-      `[num_actions]`.
+      qtransform: function to obtain the completed and scaled Q-values for a node.
     """
 
     # Do simulation, expansion, and backward steps.
-    if invalid_actions is None:
-        invalid_actions = np.zeros_like(root.prior_logits)
-
     for sim in range(num_simulations):
         parent_index, action, terminal_value = simulate(
-            board, tree, max_num_considered_actions
+            board, tree, max_num_considered_actions, qtransform
         )
         # A node first expanded on simulation `i`, will have node index `i`.
         # Node 0 corresponds to the root node.
@@ -107,24 +105,31 @@ def get_terminal_value(board: Board) -> Optional[np.float32]:
 
 
 def simulate(
-    board: Board, tree: Tree, max_num_considered_actions: int
+    board: Board,
+    tree: Tree,
+    max_num_considered_actions: int,
+    qtransform: base.QTransform = qtransform_completed_by_mix_value,
 ) -> Tuple[np.ndarray, np.ndarray, Optional[np.float32]]:
-    """Traverses the tree until reaching an unvisited action or `max_depth`.
+    """Traverses the tree until reaching an unvisited action or a terminal position.
 
     Each simulation starts from the root and keeps selecting actions traversing
-    the tree until a leaf or `max_depth` is reached.
+    the tree, moving `board` along them. The actions are selected by
+    `gumbel_muzero_root_action_selection` at the root and by
+    `gumbel_muzero_interior_action_selection` at the other nodes.
 
     Args:
-      rng_key: random number generator state, the key is consumed.
+      board: the position of the root, moved to the reached position.
       tree: _unbatched_ MCTS tree state.
-      action_selection_fn: function used to select an action during simulation.
-      max_depth: maximum search tree depth allowed during simulation.
+      max_num_considered_actions: the maximum number of actions considered by
+        Sequential Halving at the root.
+      qtransform: function to obtain the completed and scaled Q-values for a node.
 
     Returns:
       `(parent_index, action, terminal_value)` tuple, where `parent_index` is the
-      index of the node reached at the end of the simulation, the `action` is the
-      action to evaluate from the `parent_index`, and `terminal_value` is the game
-      result from the side to move if the reached position is terminal, else None.
+      index of the parent of the final selected action, the `action` is the
+      action to evaluate from the `parent_index` (`board` is at the position after
+      it), and `terminal_value` is the game result from the side to move if that
+      position is terminal, else None.
     """
 
     def body_fun(state):
@@ -132,10 +137,15 @@ def simulate(
         node_index = state.next_node_index
         if state.depth == 0:
             action = gumbel_muzero_root_action_selection(
-                tree, node_index, max_num_considered_actions
+                tree,
+                node_index,
+                max_num_considered_actions=max_num_considered_actions,
+                qtransform=qtransform,
             )
         else:
-            action = gumbel_muzero_interior_action_selection(tree, node_index)
+            action = gumbel_muzero_interior_action_selection(
+                tree, node_index, qtransform=qtransform
+            )
         next_node_index = tree.children_index[node_index, action]
         # The returned action will be visited.
         depth = state.depth + 1
@@ -190,15 +200,18 @@ def expand(
     action: np.int32,
     next_node_index: np.int32,
 ):
-    """Create and evaluate child nodes from given nodes and unvisited actions.
+    """Creates the child node with the evaluation, or updates the reached node.
 
     Args:
       tree: the MCTS tree state to update.
+      step: the evaluation of the reached position: the network outputs, or the
+        game result (without `prior_logits`) for a terminal position.
       parent_index: the index of the parent node, from which the action will be
         expanded.
       action: the action to expand.
       next_node_index: the index of the newly expanded node. This can be the index
-        of an existing node, if `max_depth` is reached.
+        of an existing node, if the reached position is terminal (terminal nodes
+        are not traversed, so they are reached again).
     """
 
     # Evaluate and create a new node.
@@ -213,7 +226,12 @@ def expand(
 def backward(board: Board, tree: Tree, leaf_index: np.int32):
     """Goes up and updates the tree until all nodes reached the root.
 
+    The values are win rates of the side to move in [0, 1], so a value is turned
+    to the parent's side by `1 - value` (mctx uses the discount -1 for the values
+    in [-1, 1] of two-player games).
+
     Args:
+      board: the reached position, moved back to the root.
       tree: the MCTS tree state to update, without the batch size.
       leaf_index: the node index from which to do the backward.
     """
@@ -254,17 +272,16 @@ def update_tree_node(
     prior_logits: Optional[np.ndarray],
     value: np.float32,
 ):
-    """Updates the tree at node index.
+    """Updates the tree at node index in place.
 
     Args:
       tree: `Tree` to whose node is to be updated.
       node_index: the index of the expanded node.
       prior_logits: the prior logits to fill in for the new node, of shape
         `[num_actions]`. None for terminal nodes, from which no action is selected.
+        Unlike mctx, their softmax is also stored (`children_prior_probs`), since
+        the Q-value transformation uses it at each selection.
       value: the value to fill in for the new node.
-
-    Returns:
-      The new tree with updated nodes.
     """
 
     new_visit = tree.node_visits[node_index] + 1

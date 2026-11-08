@@ -14,6 +14,7 @@ def gumbel_muzero_policy(
     invalid_actions: Optional[np.ndarray] = None,
     max_num_considered_actions: int = 16,
     gumbel_scale: float = 1.0,
+    qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value,
 ):
     """Runs Gumbel MuZero search and returns the `PolicyOutput`.
 
@@ -25,10 +26,14 @@ def gumbel_muzero_policy(
     with Gumbel. At non-root nodes (aka interior nodes), actions are selected by
     the Full Gumbel MuZero deterministic action selection.
 
+    Unlike mctx, this is a generator, which evaluates the leaves through the
+    caller (see `search.search`): it yields an `EvaluationStep` for each leaf, and
+    returns the `PolicyOutput` as the value of `StopIteration`.
+
     Args:
-      root: a `(prior_logits, value, embedding)` `RootFnOutput`. The
-        `prior_logits` are from a policy network. The shapes are
-        `([num_actions], [], [...])`, respectively.
+      board: the position of the root. It is back at the root after the search.
+      root: a `(prior_logits, value)` `RootFnOutput`. The `prior_logits` are from
+        a policy network. The shapes are `([num_actions], [])`, respectively.
       num_simulations: the number of simulations.
       invalid_actions: a mask with invalid actions. Invalid actions
         have ones, valid actions have zeros in the mask. Shape `[num_actions]`.
@@ -37,10 +42,11 @@ def gumbel_muzero_policy(
         valid actions is smaller.
       gumbel_scale: scale for the Gumbel noise. Evalution on perfect-information
         games can use gumbel_scale=0.0.
+      qtransform: function to obtain the completed and scaled Q-values for a node,
+        used at the root, at the non-root nodes and for the action weights.
 
     Returns:
-      `PolicyOutput` containing the proposed action, action_weights and the used
-      search tree.
+      `PolicyOutput` containing the proposed action and action_weights.
     """
     # Masking invalid actions.
     root.prior_logits = _mask_invalid_actions(root.prior_logits, invalid_actions)
@@ -60,10 +66,9 @@ def gumbel_muzero_policy(
     yield from search.search(
         board,
         tree,
-        root=root,
         max_num_considered_actions=max_num_considered_actions,
         num_simulations=num_simulations,
-        invalid_actions=invalid_actions,
+        qtransform=qtransform,
     )
     summary = tree.summary()
 
@@ -73,9 +78,7 @@ def gumbel_muzero_policy(
     # a smaller number of valid actions.
     considered_visit = np.max(summary.visit_counts)
     # The completed_qvalues include imputed values for unvisited actions.
-    completed_qvalues = qtransforms.qtransform_completed_by_mix_value(
-        tree, tree.ROOT_INDEX
-    )
+    completed_qvalues = qtransform(tree, tree.ROOT_INDEX)
     to_argmax = seq_halving.score_considered(
         considered_visit,
         gumbel,

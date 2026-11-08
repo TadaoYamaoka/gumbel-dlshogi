@@ -19,7 +19,11 @@ from gumbel_dlshogi.network import (
     add_network_argument,
     resolve_compile_options,
 )
-from gumbel_dlshogi.selfplay import selfplay_multiprocess
+from gumbel_dlshogi.selfplay import (
+    add_qtransform_arguments,
+    make_qtransform,
+    selfplay_multiprocess,
+)
 from gumbel_dlshogi.train import add_gpus_argument, train
 
 
@@ -191,6 +195,7 @@ def main():
     )
     parser.add_argument("--num_processes", type=int, default=4)
     parser.add_argument("--skip_max_moves", action="store_true")
+    add_qtransform_arguments(parser)
 
     # Training arguments
     parser.add_argument("--train_epochs", type=int, default=1)
@@ -401,6 +406,7 @@ def main():
             use_nyugyoku_features=args.use_nyugyoku_features,
             compile_options=compile_options if args.selfplay_compile else None,
             network=args.network,
+            qtransform=make_qtransform(args.value_scale, args.rescale_values),
         )
 
         # Log self-play stats to TensorBoard
@@ -415,6 +421,14 @@ def main():
             writer.add_scalar(
                 "parameters/selfplay/num_simulations",
                 num_simulations,
+                current_cycle_num,
+            )
+            writer.add_scalar(
+                "parameters/selfplay/value_scale", args.value_scale, current_cycle_num
+            )
+            writer.add_scalar(
+                "parameters/selfplay/rescale_values",
+                int(args.rescale_values),
                 current_cycle_num,
             )
             writer.add_scalar(

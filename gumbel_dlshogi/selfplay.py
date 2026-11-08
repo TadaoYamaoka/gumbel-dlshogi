@@ -1,3 +1,6 @@
+import argparse
+import functools
+import math
 import os
 import threading
 from dataclasses import dataclass
@@ -44,6 +47,7 @@ from gumbel_dlshogi.mcts import base
 from gumbel_dlshogi.mcts.action_selection import init_table
 from gumbel_dlshogi.mcts.base import EvaluationStep, RootFnOutput
 from gumbel_dlshogi.mcts.policies import _mask_invalid_actions, gumbel_muzero_policy
+from gumbel_dlshogi.mcts.qtransforms import qtransform_completed_by_mix_value
 from gumbel_dlshogi.mcts.search import MAX_MOVES
 from gumbel_dlshogi.network import (
     PolicyValueNetworkAddSigmoid,
@@ -81,11 +85,17 @@ def _get_invalid_actions(board: Board) -> np.ndarray:
 
 class Actor:
     def __init__(
-        self, max_num_considered_actions, num_simulations, queue: Queue, debug=False
+        self,
+        max_num_considered_actions,
+        num_simulations,
+        queue: Queue,
+        debug=False,
+        qtransform=qtransform_completed_by_mix_value,
     ):
         self.board = Board()
         self.max_num_considered_actions = max_num_considered_actions
         self.num_simulations = num_simulations
+        self.qtransform = qtransform
         self.step = None
         self.generator = None
         self.queue = queue
@@ -110,6 +120,7 @@ class Actor:
                 self.num_simulations,
                 invalid_actions,
                 self.max_num_considered_actions,
+                qtransform=self.qtransform,
             )
 
         try:
@@ -296,6 +307,52 @@ def write_training_data(
         stats_dict["max_moves_count"] = max_moves_count
 
 
+def _value_scale_type(value):
+    """argparse type of value_scale: a finite number of 0 or more.
+
+    A negative value reverses the order of the Q-values, and NaN breaks the search.
+    0 uses only the prior policy, for comparison.
+    """
+    try:
+        scale = float(value)
+    except ValueError:
+        scale = math.nan
+    if not (math.isfinite(scale) and scale >= 0):
+        raise argparse.ArgumentTypeError(
+            f"value_scale must be a finite number of 0 or more: {value!r}"
+        )
+    return scale
+
+
+def add_qtransform_arguments(parser):
+    """Adds the arguments of the Q-value transformation of the search."""
+    parser.add_argument(
+        "--value_scale",
+        type=_value_scale_type,
+        default=0.1,
+        help="c_scale of the Q-values in the search, 0 or more. The default is the "
+        "same as mctx (the paper uses 0.1 on Atari and 1.0 on Go and chess).",
+    )
+    parser.add_argument(
+        "--rescale_values",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Rescale the Q-values to [0, 1] by their min and max at each node",
+    )
+
+
+def make_qtransform(value_scale: float, rescale_values: bool) -> base.QTransform:
+    """Returns the Q-value transformation of the search with the settings.
+
+    It is used at the root, at the non-root nodes and for the training targets.
+    """
+    return functools.partial(
+        qtransform_completed_by_mix_value,
+        value_scale=value_scale,
+        rescale_values=rescale_values,
+    )
+
+
 def _check_compile(
     model_path, device, compile_options, network, use_nyugyoku_features
 ):
@@ -358,6 +415,7 @@ def selfplay(
     use_nyugyoku_features=False,
     compile_options=None,
     network=None,
+    qtransform=qtransform_completed_by_mix_value,
 ):
     set_nyugyoku_features(use_nyugyoku_features)
 
@@ -379,7 +437,7 @@ def selfplay(
     writer_thread.start()
 
     actors = [
-        Actor(max_num_considered_actions, num_simulations, queue, debug)
+        Actor(max_num_considered_actions, num_simulations, queue, debug, qtransform)
         for _ in range(batch_size)
     ]
 
@@ -412,6 +470,7 @@ def selfplay_worker_mp(
     use_nyugyoku_features,
     compile_options,
     network,
+    qtransform,
 ):
     """マルチプロセス用の自己対局ワーカー"""
     # 特徴量の設定はプロセス単位なので、ワーカーごとに設定する
@@ -424,7 +483,7 @@ def selfplay_worker_mp(
     init_table(max_num_considered_actions, num_simulations)
 
     actors = [
-        Actor(max_num_considered_actions, num_simulations, queue, debug)
+        Actor(max_num_considered_actions, num_simulations, queue, debug, qtransform)
         for _ in range(batch_size)
     ]
 
@@ -454,6 +513,7 @@ def selfplay_multiprocess(
     use_nyugyoku_features=False,
     compile_options=None,
     network=None,
+    qtransform=qtransform_completed_by_mix_value,
 ):
     """マルチプロセスで自己対局を実行する"""
     import multiprocessing as mp
@@ -499,6 +559,7 @@ def selfplay_multiprocess(
                 use_nyugyoku_features,
                 compile_options,
                 network,
+                qtransform,
             ),
             daemon=True,
         )
@@ -532,8 +593,6 @@ def selfplay_multiprocess(
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("model_path")
     parser.add_argument("--batch_size", type=int, default=1)
@@ -575,6 +634,7 @@ if __name__ == "__main__":
         "settings saved with the model.",
     )
     add_compile_arguments(parser)
+    add_qtransform_arguments(parser)
     args = parser.parse_args()
     compile_options = (
         {"backend": args.compile_backend, "mode": args.compile_mode}
@@ -597,6 +657,7 @@ if __name__ == "__main__":
             use_nyugyoku_features=args.use_nyugyoku_features,
             compile_options=compile_options,
             network=args.network,
+            qtransform=make_qtransform(args.value_scale, args.rescale_values),
         )
     else:
         selfplay(
@@ -612,4 +673,5 @@ if __name__ == "__main__":
             use_nyugyoku_features=args.use_nyugyoku_features,
             compile_options=compile_options,
             network=args.network,
+            qtransform=make_qtransform(args.value_scale, args.rescale_values),
         )

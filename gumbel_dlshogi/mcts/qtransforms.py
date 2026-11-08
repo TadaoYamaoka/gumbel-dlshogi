@@ -11,10 +11,39 @@ def softmax(x: np.ndarray) -> np.ndarray:
 def qtransform_completed_by_mix_value(
     tree: Tree,
     node_index: int,
-    value_scale: float = 1.0,
+    *,
+    value_scale: float = 0.1,
     maxvisit_init: float = 50.0,
+    rescale_values: bool = True,
     epsilon: float = 1e-8,
 ):
+    """Returns completed qvalues.
+
+    The missing Q-values of the unvisited actions are replaced by the
+    mixed value, defined in Appendix D of
+    "Policy improvement by planning with Gumbel":
+    https://openreview.net/forum?id=bERaNdoegnO
+
+    The Q-values are transformed by a linear transformation:
+      `(maxvisit_init + max(visit_counts)) * value_scale * qvalues`.
+
+    Args:
+      tree: _unbatched_ MCTS tree state.
+      node_index: scalar index of the parent node.
+      value_scale: scale for the Q-values (c_scale). The default is the same as
+        mctx (the paper uses 0.1 on Atari and 1.0 on Go and chess).
+      maxvisit_init: offset to the `max(visit_counts)` in the scaling factor
+        (c_visit).
+      rescale_values: if True, scale the qvalues by `1 / (max_q - min_q)`.
+      epsilon: the minimum denominator when using `rescale_values`.
+
+    Returns:
+      Completed Q-values. Shape `[num_actions]`.
+
+    Differences from mctx: `use_mixed_value` is omitted (always the mixed value,
+    the default of mctx), and the prior probabilities are the softmax stored when
+    the node is expanded (`tree.children_prior_probs`) instead of computing it here.
+    """
     qvalues = tree.qvalues(node_index)
     visit_counts = tree.children_visits[node_index]
 
@@ -29,7 +58,8 @@ def qtransform_completed_by_mix_value(
     )
 
     # Scaling the Q-values.
-    completed_qvalues = _rescale_qvalues(completed_qvalues, epsilon)
+    if rescale_values:
+        completed_qvalues = _rescale_qvalues(completed_qvalues, epsilon)
     maxvisit = np.max(visit_counts)
     visit_scale = maxvisit_init + maxvisit
     return visit_scale * value_scale * completed_qvalues
@@ -64,7 +94,8 @@ def _compute_mixed_value(raw_value, qvalues, visit_counts, prior_probs):
     Returns:
       An estimator of the state value. Shape `[]`.
     """
-    # Only the visited actions contribute, so compute over them alone.
+    # Only the visited actions contribute, so compute over them alone. mctx masks
+    # the unvisited ones instead, which gives the same value.
     visited = np.flatnonzero(visit_counts)
     if len(visited) == 0:
         return raw_value

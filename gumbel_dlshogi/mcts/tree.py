@@ -10,10 +10,11 @@ import numpy as np
 class Tree:
     """State of a search tree.
 
-    The `Tree` dataclass is used to hold and inspect search data for a batch of
-    inputs. In the fields below `B` denotes the batch dimension, `N` represents
-    the number of nodes in the tree, and `num_actions` is the number of discrete
-    actions.
+    The `Tree` dataclass is used to hold and inspect search data for a single
+    input (unlike mctx, there is no batch dimension). In the fields below `N`
+    represents the number of nodes in the tree, and `num_actions` is the number of
+    discrete actions. The values are win rates in [0, 1] of the side to move at
+    each node.
 
     node_visits: `[N]` the visit counts for each node.
     raw_values: `[N]` the raw value for each node.
@@ -30,7 +31,7 @@ class Tree:
     children_visits: `[N, num_actions]` the visit counts for children for
       each action.
     children_values: `[N, num_actions]` the value of the next node after the
-      action.
+      action, from the side to move at the parent (`1 - value of the child`).
     root_invalid_actions: `[num_actions]` a mask with invalid actions at the
       root. In the mask, invalid actions have ones, and valid actions have zeros.
     extra_data: `[...]` extra data passed to the search.
