@@ -1,3 +1,5 @@
+import argparse
+import math
 import os
 from pathlib import Path
 
@@ -18,6 +20,37 @@ def save_atomically(path, save):
         os.replace(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def bounded_float_type(
+    name,
+    minimum,
+    maximum=math.inf,
+    *,
+    include_minimum=True,
+    include_maximum=True,
+):
+    """Returns an argparse type of a finite number in the range."""
+    range_text = (
+        ("[" if include_minimum else "(")
+        + f"{minimum}, {maximum}"
+        + ("]" if include_maximum and math.isfinite(maximum) else ")")
+    )
+
+    def parse(value):
+        try:
+            number = float(value)
+        except ValueError:
+            number = math.nan
+        above = number >= minimum if include_minimum else number > minimum
+        below = number <= maximum if include_maximum else number < maximum
+        if not (math.isfinite(number) and above and below):
+            raise argparse.ArgumentTypeError(
+                f"{name} must be a finite number in {range_text}: {value!r}"
+            )
+        return number
+
+    return parse
 
 
 # 学習データは局面ファイルと方策ファイルの2つで1組になる。

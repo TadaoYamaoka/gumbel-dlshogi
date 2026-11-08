@@ -31,6 +31,7 @@ from gumbel_dlshogi.common import (
     POLICY_FILE_EXT,
     POSITION_FILE_EXT,
     TEMPORARY_FILE_EXT,
+    bounded_float_type,
     dtypeMovePolicy,
     dtypeMovesLeft,
     dtypePosition,
@@ -86,6 +87,36 @@ class TrainingData:
     is_draw: int
     is_max_moves: bool
     source: str  # Source of the start position (STARTPOS or ROOTS)
+
+
+# How a self-play game ends, in the order of the checks of Actor (only the first
+# condition that holds is set in TrainingData)
+END_REASONS = (
+    "checkmate",  # the side to move has no legal moves
+    "nyugyoku",  # the side to move can declare (入玉宣言)
+    "repetition_draw",  # 千日手
+    "repetition_win",  # 連続王手の千日手で手番側の勝ち
+    "repetition_lose",  # 連続王手の千日手で手番側の負け
+    "max_moves",
+    "mate_in_3ply",  # the side to move has a mate in 3 plies (the game is ended)
+)
+
+
+def _end_reason(training_data):
+    """Returns how the game of the training data ended (one of END_REASONS)."""
+    if training_data.is_game_over:
+        return "checkmate"
+    if training_data.is_nyugyoku:
+        return "nyugyoku"
+    if training_data.is_draw == REPETITION_DRAW:
+        return "repetition_draw"
+    if training_data.is_draw == REPETITION_WIN:
+        return "repetition_win"
+    if training_data.is_draw == REPETITION_LOSE:
+        return "repetition_lose"
+    if training_data.is_max_moves:
+        return "max_moves"
+    return "mate_in_3ply"
 
 
 def _get_invalid_actions(board: Board) -> np.ndarray:
@@ -292,6 +323,13 @@ def write_training_data(
         source: {"games": 0, "positions": 0, BLACK_WIN: 0, WHITE_WIN: 0, DRAW: 0}
         for source in SOURCES
     }
+    # Games and positions of each source and end reason, of the saved games (not
+    # of the games skipped by skip_max_moves)
+    end_stats = {
+        (source, reason): {"games": 0, "positions": 0}
+        for source in SOURCES
+        for reason in END_REASONS
+    }
 
     with tqdm(total=num_positions, unit="pos") as pbar:
         while pbar.n < num_positions:
@@ -361,6 +399,9 @@ def write_training_data(
             stats["games"] += 1
             stats["positions"] += len(training_data.policy_outputs)
             stats[result] += 1
+            stats = end_stats[training_data.source, _end_reason(training_data)]
+            stats["games"] += 1
+            stats["positions"] += len(training_data.policy_outputs)
 
             pbar.update(len(training_data.policy_outputs))
             pbar.set_postfix(
@@ -398,37 +439,14 @@ def write_training_data(
             stats_dict[f"{source}/black_wins"] = stats[BLACK_WIN]
             stats_dict[f"{source}/white_wins"] = stats[WHITE_WIN]
             stats_dict[f"{source}/draws"] = stats[DRAW]
-
-
-def _bounded_float_type(
-    name,
-    minimum,
-    maximum=math.inf,
-    *,
-    include_minimum=True,
-    include_maximum=True,
-):
-    """Returns an argparse type of a finite number in the range."""
-    range_text = (
-        ("[" if include_minimum else "(")
-        + f"{minimum}, {maximum}"
-        + ("]" if include_maximum and math.isfinite(maximum) else ")")
-    )
-
-    def parse(value):
-        try:
-            number = float(value)
-        except ValueError:
-            number = math.nan
-        above = number >= minimum if include_minimum else number > minimum
-        below = number <= maximum if include_maximum else number < maximum
-        if not (math.isfinite(number) and above and below):
-            raise argparse.ArgumentTypeError(
-                f"{name} must be a finite number in {range_text}: {value!r}"
+        # The average moves of the games by how they ended (the moves of a game
+        # are its saved positions)
+        for (source, reason), stats in end_stats.items():
+            games = stats["games"]
+            stats_dict[f"{source}/{reason}/games"] = games
+            stats_dict[f"{source}/{reason}/average_moves"] = (
+                stats["positions"] / games if games > 0 else 0
             )
-        return number
-
-    return parse
 
 
 def add_qtransform_arguments(parser):
@@ -437,7 +455,7 @@ def add_qtransform_arguments(parser):
         "--value_scale",
         # A negative value reverses the order of the Q-values, and NaN breaks the
         # search. 0 uses only the prior policy, for comparison.
-        type=_bounded_float_type("value_scale", 0),
+        type=bounded_float_type("value_scale", 0),
         default=0.1,
         help="c_scale of the Q-values in the search, 0 or more. The default is the "
         "same as mctx (the paper uses 0.1 on Atari and 1.0 on Go and chess).",
@@ -502,20 +520,20 @@ def add_moves_left_search_arguments(parser):
     """Adds the arguments of the moves-left bonus of the search."""
     parser.add_argument(
         "--moves_left_beta",
-        type=_bounded_float_type("moves_left_beta", 0),
+        type=bounded_float_type("moves_left_beta", 0),
         default=0.0,
         help="Maximum of the moves-left bonus in the search (logits), 0 or more. "
         "0 disables it. It needs a model with the moves-left head.",
     )
     parser.add_argument(
         "--moves_left_tau",
-        type=_bounded_float_type("moves_left_tau", 0, include_minimum=False),
+        type=bounded_float_type("moves_left_tau", 0, include_minimum=False),
         default=20.0,
         help="Difference of the moves left (plies) for the maximum bonus",
     )
     parser.add_argument(
         "--moves_left_threshold",
-        type=_bounded_float_type("moves_left_threshold", 0, 1, include_maximum=False),
+        type=bounded_float_type("moves_left_threshold", 0, 1, include_maximum=False),
         default=0.6,
         help="Advantage |2V - 1| from which the moves-left bonus is applied, in [0, 1)",
     )
