@@ -22,6 +22,7 @@ from gumbel_dlshogi.network import (
     resolve_compile_options,
 )
 from gumbel_dlshogi.selfplay import (
+    add_exploration_arguments,
     add_moves_left_search_arguments,
     add_qtransform_arguments,
     make_qtransforms,
@@ -64,6 +65,11 @@ def get_scheduled_value(cycle, base_value, schedule):
         else:
             break
     return current_value
+
+
+def games_record_path(records_dir, cycle):
+    """Path of the records of the self-play games of the cycle"""
+    return records_dir / f"cycle_{cycle:08d}.txt"
 
 
 def model_path(models_dir, cycle):
@@ -209,6 +215,14 @@ def main():
     add_qtransform_arguments(parser)
     add_moves_left_search_arguments(parser)
     add_start_positions_arguments(parser)
+    add_exploration_arguments(parser)
+    parser.add_argument(
+        "--record_games",
+        action="store_true",
+        help="Write the records of the self-play games of each cycle to "
+        "records/cycle_<cycle>.txt in the workspace (replaced if the cycle is run "
+        "again)",
+    )
 
     # Training arguments
     parser.add_argument("--train_epochs", type=int, default=1)
@@ -297,6 +311,7 @@ def main():
     data_dir = workspace / "data"
     log_dir = workspace / "logs"
     checkpoint_dir = workspace / "checkpoints"
+    records_dir = workspace / "records"
     models_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(exist_ok=True)
@@ -434,6 +449,15 @@ def main():
             target_qtransform=target_qtransform,
             roots=args.roots,
             roots_ratio=args.roots_ratio,
+            explore_plies=args.explore_plies,
+            explore_roots_plies=args.explore_roots_plies,
+            # Each cycle has its own random numbers
+            seed=None if args.seed is None else [args.seed, current_cycle_num],
+            record_path=(
+                str(games_record_path(records_dir, current_cycle_num))
+                if args.record_games
+                else None
+            ),
         )
 
         # Log self-play stats to TensorBoard
@@ -462,6 +486,17 @@ def main():
             writer.add_scalar(
                 "parameters/selfplay/rescale_values",
                 int(args.rescale_values),
+                current_cycle_num,
+            )
+            # -1 if not given (all the moves are the actions of the search)
+            writer.add_scalar(
+                "parameters/selfplay/explore_plies",
+                -1 if args.explore_plies is None else args.explore_plies,
+                current_cycle_num,
+            )
+            writer.add_scalar(
+                "parameters/selfplay/explore_roots_plies",
+                args.explore_roots_plies,
                 current_cycle_num,
             )
             writer.add_scalar(

@@ -11,7 +11,10 @@ same definitions as the training losses, so that models with and without the
 moves-left head can be compared:
 
 - policy: the cross entropy with the policy targets (the improved policies of the
-  search), and the agreement of the most probable moves
+  search), and the agreement of the most probable moves. The entropy of the targets
+  and the KL divergence (the cross entropy minus the entropy) are also reported,
+  since the sharpness of the targets (e.g. by value_scale of the search) changes
+  the cross entropy.
 - value: the binary cross entropy and the Brier score with the game results, and the
   accuracy (the result is a win if it is more than 0.5, as the training evaluation)
 
@@ -66,7 +69,14 @@ def evaluate(model_path, data_dir, batch_size, use_nyugyoku_features, amp, num_f
     )
 
     sums = dict.fromkeys(
-        ("policy_loss", "policy_agreement", "value_loss", "brier", "value_accuracy"),
+        (
+            "policy_loss",
+            "policy_agreement",
+            "policy_target_entropy",
+            "value_loss",
+            "brier",
+            "value_accuracy",
+        ),
         0.0,
     )
     positions = 0
@@ -85,6 +95,10 @@ def evaluate(model_path, data_dir, batch_size, use_nyugyoku_features, amp, num_f
             )
             sums["policy_agreement"] += float(
                 (logits.argmax(dim=1) == policies.argmax(dim=1)).sum()
+            )
+            # xlogy is 0 for the zero probabilities
+            sums["policy_target_entropy"] -= float(
+                torch.special.xlogy(policies, policies).sum()
             )
             sums["value_loss"] += float(
                 F.binary_cross_entropy_with_logits(
@@ -190,6 +204,9 @@ def main():
     print(f"positions: {metrics['positions']}")
     print(f"policy cross entropy: {metrics['policy_loss']:.4f}")
     print(f"policy agreement:     {metrics['policy_agreement']:.4f}")
+    print(f"policy target entropy: {metrics['policy_target_entropy']:.4f}")
+    kl = metrics["policy_loss"] - metrics["policy_target_entropy"]
+    print(f"policy KL (CE - target entropy): {kl:.4f}")
     print(f"value BCE:            {metrics['value_loss']:.4f}")
     print(f"value Brier score:    {metrics['brier']:.4f}")
     print(f"value accuracy:       {metrics['value_accuracy']:.4f}")

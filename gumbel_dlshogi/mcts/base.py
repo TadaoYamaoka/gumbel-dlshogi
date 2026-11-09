@@ -47,10 +47,12 @@ class PolicyOutput:
       The action weights sum to one. Usually, the policy network is trained by
       cross-entropy:
       `cross_entropy(labels=stop_gradient(action_weights), logits=prior_logits)`.
+    search_tree: the search tree of the finished search.
     """
 
     action: np.int32
     action_weights: np.ndarray
+    search_tree: tree.Tree
 
 
 QTransform = Callable[[tree.Tree, int], np.ndarray]

@@ -51,7 +51,8 @@ def gumbel_muzero_policy(
         changes the visits and so the Q-values.
 
     Returns:
-      `PolicyOutput` containing the proposed action and action_weights.
+      `PolicyOutput` containing the proposed action, action_weights and the used
+      search tree.
     """
     # Masking invalid actions.
     root.prior_logits = _mask_invalid_actions(root.prior_logits, invalid_actions)
@@ -103,7 +104,9 @@ def gumbel_muzero_policy(
         root.prior_logits + target_qvalues, invalid_actions
     )
     action_weights = softmax(completed_search_logits)
-    return base.PolicyOutput(action=action, action_weights=action_weights)
+    return base.PolicyOutput(
+        action=action, action_weights=action_weights, search_tree=tree
+    )
 
 
 def _mask_invalid_actions(logits, invalid_actions):

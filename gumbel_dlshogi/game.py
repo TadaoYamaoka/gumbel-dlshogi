@@ -20,6 +20,9 @@ END_REASONS = {
     "mate_in_3ply": 1.0,  # the side to move has a mate in 3 plies (the game ends)
 }
 
+# Names of the game results in the records of the games
+RESULT_NAMES = {BLACK_WIN: "black_win", WHITE_WIN: "white_win", DRAW: "draw"}
+
 
 def end_reason(board: Board) -> Optional[str]:
     """Returns how the game ends at the position (one of END_REASONS), or None."""

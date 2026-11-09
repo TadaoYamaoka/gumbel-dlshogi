@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import functools
 import os
 import threading
@@ -39,7 +40,13 @@ from gumbel_dlshogi.features import (
     make_move_label,
     set_nyugyoku_features,
 )
-from gumbel_dlshogi.game import END_REASONS, MAX_MOVES, end_reason, game_result
+from gumbel_dlshogi.game import (
+    END_REASONS,
+    MAX_MOVES,
+    RESULT_NAMES,
+    end_reason,
+    game_result,
+)
 from gumbel_dlshogi.initial_model import (
     check_torchscript_model,
     read_model_settings,
@@ -74,10 +81,12 @@ from gumbel_dlshogi.network import (
 @dataclass
 class TrainingData:
     hcps: np.ndarray
-    policy_outputs: list[base.PolicyOutput]
+    action_weights: list[np.ndarray]  # The policy targets of the positions
     turn: int  # The side to move at the end
     end_reason: str  # How the game ended (one of game.END_REASONS)
     source: str  # Source of the start position (STARTPOS or ROOTS)
+    start_sfen: str  # The start position
+    moves: list[int]  # The moves played from the start position
 
 
 def _get_invalid_actions(board: Board) -> np.ndarray:
@@ -103,6 +112,25 @@ def move_from_label(board: Board, label) -> int:
     )
     assert move is not None
     return move
+
+
+def sample_by_visit_counts(search_tree) -> int:
+    """Samples an action proportionally to the visit counts of the root.
+
+    It is the action of muzero_policy of mctx with temperature 1, used for the
+    explorative actions in the first moves of the self-play games (as Gumbel MuZero
+    in the paper). The actions not visited (e.g. invalid ones) are not sampled.
+
+    Raises:
+        ValueError: If the root has no visits (e.g. with no simulations), where the
+            visit_probs of the summary would be uniform over all the actions.
+    """
+    visit_counts = search_tree.summary().visit_counts.astype(np.float64)
+    total_counts = visit_counts.sum()
+    if total_counts == 0:
+        raise ValueError("The root has no visits to sample an action from")
+    # Normalized in float64, since np.random.choice checks the sum strictly
+    return np.random.choice(len(visit_counts), p=visit_counts / total_counts)
 
 
 class MoveSearch:
@@ -169,6 +197,13 @@ class Actor:
 
     Like MoveSearch, the caller evaluates the position of board and sets the result
     to step after each call of next().
+
+    With explore_plies, the moves of the plies before it (counted from the start
+    position, by both sides) are sampled proportionally to the visit counts instead
+    of the action of the search, in the games from the initial position (STARTPOS).
+    The games from the roots use explore_roots_plies instead, counted from the
+    roots, since the plies of the roots from the initial position are not known.
+    The training targets are the same either way.
     """
 
     def __init__(
@@ -180,6 +215,8 @@ class Actor:
         qtransform=qtransform_completed_by_mix_value,
         start_positions=None,
         target_qtransform=None,
+        explore_plies=None,
+        explore_roots_plies=0,
     ):
         self.board = Board()
         self.search = MoveSearch(
@@ -196,9 +233,11 @@ class Actor:
         self.started = False
         self.queue = queue
         self.debug = debug
+        self.explore_plies = explore_plies
+        self.explore_roots_plies = explore_roots_plies
 
         self.hcps = np.empty(MAX_MOVES, dtype=HuffmanCodedPos)
-        self.policy_outputs = []
+        self.action_weights = []
 
     @property
     def step(self):
@@ -210,7 +249,7 @@ class Actor:
         self.source = self.start_positions.set_start_position(self.board)
         self.start_sfen = self.board.sfen()
         self.search.reset()
-        self.policy_outputs = []
+        self.action_weights = []
 
     def next(self):
         if not self.started:
@@ -222,9 +261,17 @@ class Actor:
         if policy_output is None:
             return
 
-        self.board.to_hcp(np.asarray(self.hcps[len(self.policy_outputs)]))
-        self.policy_outputs.append(policy_output)
-        self.board.push(move_from_label(self.board, policy_output.action))
+        ply = len(self.action_weights)
+        action = policy_output.action
+        explore_plies = (
+            self.explore_plies if self.source == STARTPOS else self.explore_roots_plies
+        )
+        if explore_plies is not None and ply < explore_plies:
+            action = sample_by_visit_counts(policy_output.search_tree)
+        self.board.to_hcp(np.asarray(self.hcps[ply]))
+        # Only the targets are kept, so that the search tree is released
+        self.action_weights.append(policy_output.action_weights)
+        self.board.push(move_from_label(self.board, action))
 
         reason = end_reason(self.board)
         if reason is None:
@@ -238,11 +285,13 @@ class Actor:
             print(f"{position} moves {moves}")
         self.queue.put(
             TrainingData(
-                hcps=self.hcps[: len(self.policy_outputs)].copy(),
-                policy_outputs=self.policy_outputs,
+                hcps=self.hcps[: len(self.action_weights)].copy(),
+                action_weights=self.action_weights,
                 turn=self.board.turn,
                 end_reason=reason,
                 source=self.source,
+                start_sfen=self.start_sfen,
+                moves=self.board.history,
             )
         )
         self._start_game()
@@ -289,13 +338,36 @@ def set_evaluations(actors, outputs):
         actor.step.moves_left = None if moves_left is None else moves_left[i]
 
 
+def game_record(training_data: TrainingData) -> str:
+    """Returns the record of the game: the start position and the moves (USI), the
+    result and how it ended."""
+    position = (
+        "startpos"
+        if training_data.source == STARTPOS
+        else f"sfen {training_data.start_sfen}"
+    )
+    moves = " ".join(move_to_usi(move) for move in training_data.moves)
+    result = game_result(training_data.end_reason, training_data.turn)
+    return (
+        f"{position} moves {moves}\tresult={RESULT_NAMES[result]}\t"
+        f"reason={training_data.end_reason}"
+    )
+
+
 def write_training_data(
     queue: Queue,
     output_dir: str,
     num_positions: int,
     skip_max_moves: bool = False,
     stats_dict=None,
+    record_path=None,
 ):
+    """Writes the games from the queue to the training data files.
+
+    With record_path, the records of the saved games (see game_record) are also
+    written to the file, one game per line. It is written with a temporary name and
+    published with the data files, replacing the file if it exists.
+    """
     os.makedirs(output_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -327,7 +399,12 @@ def write_training_data(
         for reason in END_REASONS
     }
 
-    with tqdm(total=num_positions, unit="pos") as pbar:
+    record_file = contextlib.nullcontext()
+    if record_path is not None:
+        os.makedirs(os.path.dirname(record_path) or ".", exist_ok=True)
+        record_file = open(record_path + TEMPORARY_FILE_EXT, "w", encoding="utf-8")
+
+    with record_file, tqdm(total=num_positions, unit="pos") as pbar:
         while pbar.n < num_positions:
             training_data = queue.get()
             if training_data is None:
@@ -344,7 +421,7 @@ def write_training_data(
                 if skip_max_moves:
                     continue
 
-            num_positions_in_game = len(training_data.policy_outputs)
+            num_positions_in_game = len(training_data.action_weights)
             positions = np.empty(num_positions_in_game, dtype=dtypePosition)
             positions["hcp"] = training_data.hcps
             positions["result"] = result
@@ -358,12 +435,12 @@ def write_training_data(
                     num_positions_in_game, 0, -1, dtype=dtypeMovesLeft
                 )
             move_policies = []
-            for i, policy_output in enumerate(training_data.policy_outputs):
+            for i, action_weights in enumerate(training_data.action_weights):
                 # 確率が0でない手だけを保存する(0の手は読み込み時に0で復元される)
-                labels = np.flatnonzero(policy_output.action_weights)
+                labels = np.flatnonzero(action_weights)
                 move_policy = np.empty(len(labels), dtype=dtypeMovePolicy)
                 move_policy["label"] = labels
-                move_policy["prob"] = policy_output.action_weights[labels]
+                move_policy["prob"] = action_weights[labels]
                 move_policies.append(move_policy)
                 positions["num_moves"][i] = len(labels)
 
@@ -374,18 +451,20 @@ def write_training_data(
                 moves_left.tofile(f)
             with open(position_path, "ab") as f:
                 positions.tofile(f)
+            if record_path is not None:
+                record_file.write(game_record(training_data) + "\n")
 
-            total_moves += len(training_data.policy_outputs)
+            total_moves += num_positions_in_game
             total_games += 1
             stats = source_stats[training_data.source]
             stats["games"] += 1
-            stats["positions"] += len(training_data.policy_outputs)
+            stats["positions"] += num_positions_in_game
             stats[result] += 1
             stats = end_stats[training_data.source, reason]
             stats["games"] += 1
-            stats["positions"] += len(training_data.policy_outputs)
+            stats["positions"] += num_positions_in_game
 
-            pbar.update(len(training_data.policy_outputs))
+            pbar.update(num_positions_in_game)
             pbar.set_postfix(
                 {
                     "Games": total_games,
@@ -396,10 +475,15 @@ def write_training_data(
                 }
             )
 
-    # Publish the files (closed above) if a game is saved, the position file last
+    # Publish the files (closed above) if a game is saved. The position file is the
+    # mark of the completion, so it is the last, after the records of the games.
     if total_games > 0:
-        for path in paths:
+        policy, moves_left, position = paths
+        records = [] if record_path is None else [record_path]
+        for path in [policy, moves_left, *records, position]:
             os.replace(path + TEMPORARY_FILE_EXT, path)
+    elif record_path is not None:
+        os.remove(record_path + TEMPORARY_FILE_EXT)
 
     # Store final stats
     if stats_dict is not None:
@@ -526,6 +610,59 @@ def add_moves_left_search_arguments(parser):
     )
 
 
+def _non_negative_int(value):
+    """argparse type of an integer of 0 or more"""
+    try:
+        number = int(value)
+    except ValueError:
+        number = -1
+    if number < 0:
+        raise argparse.ArgumentTypeError(
+            f"It must be an integer of 0 or more: {value!r}"
+        )
+    return number
+
+
+def add_exploration_arguments(parser):
+    """Adds the arguments of the explorative actions and the random numbers."""
+    parser.add_argument(
+        "--explore_plies",
+        type=_non_negative_int,
+        help="In the games from the initial position, sample the moves of the "
+        "plies before this (counted from the start position, by both sides) "
+        "proportionally to the visit counts, as Gumbel MuZero in the paper (30 on "
+        "Go and chess). Without it (or 0), all the moves are the actions of the "
+        "search. The training targets are the same.",
+    )
+    parser.add_argument(
+        "--explore_roots_plies",
+        type=_non_negative_int,
+        default=0,
+        help="--explore_plies of the games from the roots, counted from the roots "
+        "(the plies of the roots from the initial position are not known). "
+        "The default is 0: all the moves are the actions of the search.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Seed of the random numbers of the self-play workers (the Gumbel noise, "
+        "the explorative actions and the start positions). The order of the games "
+        "of the processes and the GPU computations are not reproduced by it.",
+    )
+
+
+def _seed_worker(seed_sequence):
+    """Seeds the random numbers of a self-play worker, and returns the generator of
+    its start positions.
+
+    The global random state of NumPy (the Gumbel noise of the search and the
+    explorative actions) and the start positions use independent sequences.
+    """
+    search_sequence, positions_sequence = seed_sequence.spawn(2)
+    np.random.seed(search_sequence.generate_state(4))
+    return np.random.default_rng(positions_sequence)
+
+
 def model_has_moves_left(model_path):
     """Whether the TorchScript model has the moves-left head (by its settings)."""
     model_settings = read_model_settings(model_path)
@@ -611,7 +748,12 @@ def selfplay(
     roots=None,
     roots_ratio=1.0,
     target_qtransform=None,
+    explore_plies=None,
+    explore_roots_plies=0,
+    seed=None,
+    record_path=None,
 ):
+    """Runs self-play in a single process (see selfplay_multiprocess for the args)."""
     set_nyugyoku_features(use_nyugyoku_features)
     if roots is not None:
         check_roots_file(roots)
@@ -622,16 +764,28 @@ def selfplay(
             model_path, device, compile_options, network, use_nyugyoku_features
         )
     model = load_model(model_path, device, compile_options, network)
-    start_positions = StartPositions(roots, roots_ratio)
+    rng = None
+    if seed is not None:
+        print(f"Self-play seed: {seed}")
+        # The same sequences as the first worker of selfplay_multiprocess
+        rng = _seed_worker(np.random.SeedSequence(seed).spawn(1)[0])
+    start_positions = StartPositions(roots, roots_ratio, rng)
 
     init_table(max_num_considered_actions, num_simulations)
 
     queue = Queue()
-    writer_thread = threading.Thread(
-        target=write_training_data,
-        args=(queue, output_dir, num_positions, skip_max_moves),
-        daemon=True,
-    )
+    writer_errors = []
+
+    def write():
+        # An exception in a thread does not reach this thread, so it is kept
+        try:
+            write_training_data(
+                queue, output_dir, num_positions, skip_max_moves, None, record_path
+            )
+        except BaseException as e:
+            writer_errors.append(e)
+
+    writer_thread = threading.Thread(target=write, daemon=True)
     writer_thread.start()
 
     actors = [
@@ -643,6 +797,8 @@ def selfplay(
             qtransform=qtransform,
             start_positions=start_positions,
             target_qtransform=target_qtransform,
+            explore_plies=explore_plies,
+            explore_roots_plies=explore_roots_plies,
         )
         for _ in range(batch_size)
     ]
@@ -663,6 +819,12 @@ def selfplay(
         queue.put(None)
         writer_thread.join()
 
+    # The data may not be published if the writer has failed: stop here
+    if writer_errors:
+        raise RuntimeError("The writer of the self-play data has failed") from (
+            writer_errors[0]
+        )
+
 
 def selfplay_worker_mp(
     lock,
@@ -681,6 +843,9 @@ def selfplay_worker_mp(
     roots,
     roots_ratio,
     target_qtransform,
+    explore_plies,
+    explore_roots_plies,
+    seed_sequence,
 ):
     """マルチプロセス用の自己対局ワーカー"""
     # 特徴量の設定はプロセス単位なので、ワーカーごとに設定する
@@ -691,8 +856,9 @@ def selfplay_worker_mp(
         model = load_model(model_path, device, compile_options, network)
 
     init_table(max_num_considered_actions, num_simulations)
+    rng = None if seed_sequence is None else _seed_worker(seed_sequence)
     # The file is opened in each process, which shares its pages with the others
-    start_positions = StartPositions(roots, roots_ratio)
+    start_positions = StartPositions(roots, roots_ratio, rng)
 
     actors = [
         Actor(
@@ -703,6 +869,8 @@ def selfplay_worker_mp(
             qtransform=qtransform,
             start_positions=start_positions,
             target_qtransform=target_qtransform,
+            explore_plies=explore_plies,
+            explore_roots_plies=explore_roots_plies,
         )
         for _ in range(batch_size)
     ]
@@ -738,8 +906,23 @@ def selfplay_multiprocess(
     roots=None,
     roots_ratio=1.0,
     target_qtransform=None,
+    explore_plies=None,
+    explore_roots_plies=0,
+    seed=None,
+    record_path=None,
 ):
-    """マルチプロセスで自己対局を実行する"""
+    """マルチプロセスで自己対局を実行する
+
+    Args:
+        explore_plies: The plies of the games from the initial position whose moves
+            are sampled proportionally to the visit counts (see Actor), or None.
+        explore_roots_plies: explore_plies of the games from the roots, counted
+            from the roots.
+        seed: None, or the seed (an integer or a sequence of integers) of
+            np.random.SeedSequence, from which each worker has its own sequences.
+        record_path: None, or the file to write the records of the saved games to
+            (see write_training_data).
+    """
     import multiprocessing as mp
 
     # Check the options here, since an error in the workers does not stop the writer
@@ -764,12 +947,17 @@ def selfplay_multiprocess(
 
     writer_process = mp.Process(
         target=write_training_data,
-        args=(queue, output_dir, num_positions, skip_max_moves, stats_dict),
+        args=(queue, output_dir, num_positions, skip_max_moves, stats_dict, record_path),
     )
     writer_process.start()
 
+    seed_sequences = [None] * num_processes
+    if seed is not None:
+        print(f"Self-play seed: {seed}")
+        seed_sequences = np.random.SeedSequence(seed).spawn(num_processes)
+
     processes = []
-    for _ in range(num_processes):
+    for seed_sequence in seed_sequences:
         p = mp.Process(
             target=selfplay_worker_mp,
             args=(
@@ -789,6 +977,9 @@ def selfplay_multiprocess(
                 roots,
                 roots_ratio,
                 target_qtransform,
+                explore_plies,
+                explore_roots_plies,
+                seed_sequence,
             ),
             daemon=True,
         )
@@ -818,6 +1009,13 @@ def selfplay_multiprocess(
             writer_process.join()
         print("All processes terminated.")
 
+    # The writer also exits when it fails (e.g. a file cannot be written), and then
+    # the data may not be published: stop here before they are used
+    if writer_process.exitcode != 0:
+        raise RuntimeError(
+            f"The writer of the self-play data has failed (exit code: "
+            f"{writer_process.exitcode})"
+        )
     return dict(stats_dict)
 
 
@@ -866,6 +1064,12 @@ if __name__ == "__main__":
     add_qtransform_arguments(parser)
     add_moves_left_search_arguments(parser)
     add_start_positions_arguments(parser)
+    add_exploration_arguments(parser)
+    parser.add_argument(
+        "--record_games",
+        help="Write the records of the saved games to this file (USI moves from the "
+        "start position, the result and how it ended)",
+    )
     args = parser.parse_args()
     if args.moves_left_beta > 0 and not model_has_moves_left(args.model_path):
         parser.error(
@@ -903,6 +1107,10 @@ if __name__ == "__main__":
             target_qtransform=target_qtransform,
             roots=args.roots,
             roots_ratio=args.roots_ratio,
+            explore_plies=args.explore_plies,
+            explore_roots_plies=args.explore_roots_plies,
+            seed=args.seed,
+            record_path=args.record_games,
         )
     else:
         selfplay(
@@ -922,4 +1130,8 @@ if __name__ == "__main__":
             target_qtransform=target_qtransform,
             roots=args.roots,
             roots_ratio=args.roots_ratio,
+            explore_plies=args.explore_plies,
+            explore_roots_plies=args.explore_roots_plies,
+            seed=args.seed,
+            record_path=args.record_games,
         )

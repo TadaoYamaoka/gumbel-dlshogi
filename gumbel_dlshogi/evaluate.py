@@ -23,12 +23,12 @@ from collections import deque
 
 import numpy as np
 import torch
-from cshogi import BLACK, BLACK_WIN, DRAW, WHITE_WIN, Board, move_to_usi
+from cshogi import BLACK, BLACK_WIN, DRAW, Board, move_to_usi
 from torch.amp import autocast
 
 from gumbel_dlshogi.common import bounded_float_type
 from gumbel_dlshogi.features import make_input_features, set_nyugyoku_features
-from gumbel_dlshogi.game import END_REASONS, end_reason, game_result
+from gumbel_dlshogi.game import END_REASONS, RESULT_NAMES, end_reason, game_result
 from gumbel_dlshogi.initial_model import read_model_settings
 from gumbel_dlshogi.mcts.action_selection import init_table
 from gumbel_dlshogi.selfplay import (
@@ -120,10 +120,9 @@ class Game:
 
     def record(self, names):
         position = "startpos" if self.start_sfen is None else f"sfen {self.start_sfen}"
-        result = {BLACK_WIN: "black_win", WHITE_WIN: "white_win", DRAW: "draw"}
         return (
             f"{position} moves {' '.join(self.moves)}\tblack={names[self.black]}\t"
-            f"white={names[1 - self.black]}\tresult={result[self.result]}\t"
+            f"white={names[1 - self.black]}\tresult={RESULT_NAMES[self.result]}\t"
             f"reason={self.reason}"
         )
 
