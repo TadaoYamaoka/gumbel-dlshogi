@@ -629,11 +629,12 @@ def add_exploration_arguments(parser):
     parser.add_argument(
         "--explore_plies",
         type=_non_negative_int,
+        default=30,
         help="In the games from the initial position, sample the moves of the "
         "plies before this (counted from the start position, by both sides) "
-        "proportionally to the visit counts, as Gumbel MuZero in the paper (30 on "
-        "Go and chess). Without it (or 0), all the moves are the actions of the "
-        "search. The training targets are the same.",
+        "proportionally to the visit counts. The default is the same as Gumbel "
+        "MuZero in the paper on Go and chess. With 0, all the moves are the "
+        "actions of the search. The training targets are the same.",
     )
     parser.add_argument(
         "--explore_roots_plies",
