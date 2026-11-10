@@ -522,9 +522,10 @@ def add_qtransform_arguments(parser):
         # A negative value reverses the order of the Q-values, and NaN breaks the
         # search. 0 uses only the prior policy, for comparison.
         type=bounded_float_type("value_scale", 0),
-        default=0.1,
+        default=1.0,
         help="c_scale of the Q-values in the search, 0 or more. The default is the "
-        "same as mctx (the paper uses 0.1 on Atari and 1.0 on Go and chess).",
+        "same as the paper on Go and chess (the paper uses 0.1 on Atari, the "
+        "default of mctx).",
     )
     parser.add_argument(
         "--rescale_values",
