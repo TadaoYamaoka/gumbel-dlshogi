@@ -80,7 +80,7 @@ class Tree:
         """Extract summary statistics for the root node."""
         # Get state and action values for the root nodes.
         value = self.node_values[Tree.ROOT_INDEX]
-        qvalue = self.qvalues(Tree.ROOT_INDEX)
+        qvalues = self.qvalues(Tree.ROOT_INDEX)
         # Extract visit counts and induced probabilities for the root nodes.
         visit_counts = self.children_visits[Tree.ROOT_INDEX].astype(value.dtype)
         total_counts = np.sum(visit_counts, axis=-1, keepdims=True)
@@ -91,7 +91,7 @@ class Tree:
             visit_counts=visit_counts,
             visit_probs=visit_probs,
             value=value,
-            qvalue=qvalue,
+            qvalues=qvalues,
         )
 
 
@@ -104,4 +104,4 @@ class SearchSummary:
     visit_counts: np.ndarray
     visit_probs: np.ndarray
     value: np.float32
-    qvalue: np.float32
+    qvalues: np.ndarray
