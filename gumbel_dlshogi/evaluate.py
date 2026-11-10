@@ -244,17 +244,26 @@ def score_interval(games, player):
     """Returns an approximate 95% interval of the score of the player.
 
     The two games from the same start position are not independent, so the unit is
-    the pair: the t interval of the mean of the scores of the pairs. It is an
-    approximation (e.g. about 94% of coverage with 10 pairs of only wins or losses
-    of both games). Without variance (fewer than 2 pairs, or all the pairs of the
-    same score), the pairs do not tell the uncertainty, so it is [0, 1].
+    the pair, assuming the pairs are independent: the t interval of the mean of the
+    scores of the pairs. It is an approximation (e.g. about 94% of coverage with 10
+    pairs of only wins or losses of both games). When all the n pairs have the same
+    score s, the t interval has no width, so the interval is conservative instead:
+    p = 0.025^(1/n) is the one-sided 97.5% lower bound of the probability of a pair
+    of the score s (Clopper-Pearson for n of n), and the score of the other pairs is
+    anywhere in [0, 1], which gives [s * p, s * p + (1 - p)] for the mean score
+    (e.g. the lower bound 0.9908 for 400 pairs of only wins of both games). Without
+    pairs, it is [0, 1].
     """
     pairs = {}
     for game in games:
         pairs.setdefault(game.pair, []).append(game.score(player))
     scores = np.array([np.mean(pair) for pair in pairs.values()])
-    if len(scores) < 2 or np.all(scores == scores[0]):
+    if len(scores) == 0:
         return 0.0, 1.0
+    if np.all(scores == scores[0]):
+        p = 0.025 ** (1 / len(scores))
+        low = float(scores[0]) * p
+        return low, low + (1 - p)
     margin = (
         _t_quantile(len(scores) - 1) * scores.std(ddof=1) / math.sqrt(len(scores))
     )
